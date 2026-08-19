@@ -1,0 +1,64 @@
+# Scribe plus a model server, for the N100.
+#
+# Two containers rather than one on purpose: the model is the part you will want to change —
+# try Florence-2, then TrOCR, then whatever is best in six months — and behind an HTTP boundary
+# that is a config change instead of a rebuild.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#   docker compose run --rm scribe -check     # verify before letting it loose on the library
+
+services:
+  scribe:
+    build: ..
+    container_name: scribe
+    restart: unless-stopped
+    depends_on:
+      - model
+    environment:
+      SCRIBE_COUCH_URL: ${SCRIBE_COUCH_URL}
+      SCRIBE_COUCH_USER: ${SCRIBE_COUCH_USER}
+      SCRIBE_COUCH_PASSWORD: ${SCRIBE_COUCH_PASSWORD}
+      SCRIBE_NOTES_DB: ${SCRIBE_NOTES_DB:-notes}
+      SCRIBE_TEXT_DB: ${SCRIBE_TEXT_DB:-notes_text}
+      SCRIBE_MODEL_URL: ${SCRIBE_MODEL_URL:-http://model:11434/v1}
+      SCRIBE_MODEL: ${SCRIBE_MODEL}
+      SCRIBE_MODEL_TIMEOUT: ${SCRIBE_MODEL_TIMEOUT:-5m}
+      SCRIBE_LANGUAGE: ${SCRIBE_LANGUAGE:-en}
+      SCRIBE_DEVICE_ID: ${SCRIBE_DEVICE_ID:-server}
+      SCRIBE_POLL: ${SCRIBE_POLL:-30s}
+      SCRIBE_STATE: /var/lib/scribe/state.json
+      SCRIBE_LOG_LEVEL: ${SCRIBE_LOG_LEVEL:-info}
+    volumes:
+      - scribe-state:/var/lib/scribe
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Ollama serves an OpenAI-compatible API at /v1, which is what scribe speaks. Swap this for
+  # llama.cpp's server, vLLM, or an OpenVINO-backed one without touching scribe — point
+  # SCRIBE_MODEL_URL somewhere else and it neither knows nor cares.
+  #
+  # On an N100 the iGPU is reachable through OpenVINO rather than through Ollama, so this
+  # container runs on the CPU. That is fine for overnight batches and hopeless for anything
+  # interactive; see the README before expecting speed.
+  model:
+    image: ollama/ollama:latest
+    container_name: scribe-model
+    restart: unless-stopped
+    volumes:
+      - model-cache:/root/.ollama
+    # Uncomment to hand the iGPU to a runtime that can use it.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  scribe-state:
+  model-cache:

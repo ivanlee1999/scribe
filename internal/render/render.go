@@ -68,8 +68,8 @@ type Result struct {
 }
 
 var (
-	inkColor       = color.RGBA{A: 255}                             // black
-	highlightColor = color.RGBA{R: 170, G: 170, B: 170, A: 255}      // MARKER, kept light
+	inkColor       = color.RGBA{A: 255}                         // black
+	highlightColor = color.RGBA{R: 170, G: 170, B: 170, A: 255} // MARKER, kept light
 	paper          = color.RGBA{R: 255, G: 255, B: 255, A: 255}
 )
 

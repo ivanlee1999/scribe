@@ -1,0 +1,227 @@
+// Package recognize hands a page image to a model and gets text back.
+//
+// The model sits behind HTTP rather than being linked in, and that is the main design decision
+// here. The model is the part most likely to change — you will want to try Florence-2, then
+// TrOCR, then whatever is best in six months — and putting it behind a socket means swapping it
+// is a config change rather than a rebuild. It also keeps Go out of the business of hosting
+// inference, which it is bad at.
+//
+// The wire format is OpenAI's chat-completions API, because nearly everything speaks it:
+// llama.cpp's server, vLLM, LM Studio, LocalAI, and Ollama (at its /v1 endpoint). Anything that
+// does not can be put behind a twenty-line adapter.
+package recognize
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Result is one page's reading.
+type Result struct {
+	Text     string
+	Engine   string
+	Language string
+}
+
+// Recognizer reads handwriting out of a page image.
+type Recognizer interface {
+	Recognize(ctx context.Context, png []byte) (Result, error)
+	// Engine names this recognizer in the documents it produces, e.g. "qwen2.5vl:3b".
+	Engine() string
+}
+
+// DefaultPrompt asks for a transcription and nothing else.
+//
+// The instructions are blunt on purpose. Left to themselves these models editorialize — "The
+// image shows handwritten notes that appear to say..." — and every word of that lands in the
+// user's vault as though they had written it.
+const DefaultPrompt = `Transcribe the handwriting in this image.
+
+Rules:
+- Output only the transcribed text. No preamble, no commentary, no markdown fences.
+- Preserve line breaks as they appear.
+- If a word is illegible, write [?] in its place.
+- If there is no handwriting, output nothing at all.`
+
+// VisionModel is an OpenAI-compatible chat-completions endpoint.
+type VisionModel struct {
+	// BaseURL is the server root, e.g. http://127.0.0.1:11434/v1
+	BaseURL string
+	// APIKey is sent when set. Local servers usually ignore it; some require any non-empty value.
+	APIKey string
+	Model  string
+	Prompt string
+	// Language is recorded on the documents this produces. The model is not asked to detect it:
+	// a guess in a field that is only ever displayed is worse than an honest configured value.
+	Language string
+	HTTP     *http.Client
+}
+
+func NewVisionModel(baseURL, apiKey, model, prompt, language string, timeout time.Duration) *VisionModel {
+	if prompt == "" {
+		prompt = DefaultPrompt
+	}
+	return &VisionModel{
+		BaseURL:  strings.TrimRight(baseURL, "/"),
+		APIKey:   apiKey,
+		Model:    model,
+		Prompt:   prompt,
+		Language: language,
+		HTTP:     &http.Client{Timeout: timeout},
+	}
+}
+
+func (v *VisionModel) Engine() string { return v.Model }
+
+func (v *VisionModel) Recognize(ctx context.Context, png []byte) (Result, error) {
+	type imageURL struct {
+		URL string `json:"url"`
+	}
+	type content struct {
+		Type     string    `json:"type"`
+		Text     string    `json:"text,omitempty"`
+		ImageURL *imageURL `json:"image_url,omitempty"`
+	}
+	type message struct {
+		Role    string    `json:"role"`
+		Content []content `json:"content"`
+	}
+	request := struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+		// Deterministic: the same ink should not read differently every time it is looked at,
+		// and a page that changes wording on each pass would republish forever.
+		Temperature float64 `json:"temperature"`
+		Stream      bool    `json:"stream"`
+	}{
+		Model:       v.Model,
+		Temperature: 0,
+		Messages: []message{{
+			Role: "user",
+			Content: []content{
+				{Type: "text", Text: v.Prompt},
+				{Type: "image_url", ImageURL: &imageURL{
+					URL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+				}},
+			},
+		}},
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return Result{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.BaseURL+"/chat/completions",
+		bytes.NewReader(body))
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if v.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+v.APIKey)
+	}
+
+	resp, err := v.HTTP.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Result{}, err
+	}
+	if resp.StatusCode >= 400 {
+		snippet := string(payload)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return Result{}, fmt.Errorf("model returned %d: %s", resp.StatusCode, snippet)
+	}
+
+	var answer struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(payload, &answer); err != nil {
+		return Result{}, fmt.Errorf("unreadable model response: %w", err)
+	}
+	if len(answer.Choices) == 0 {
+		return Result{}, fmt.Errorf("model returned no choices")
+	}
+
+	return Result{
+		Text:     Clean(answer.Choices[0].Message.Content),
+		Engine:   v.Model,
+		Language: v.Language,
+	}, nil
+}
+
+// Clean strips the packaging models put around a transcription.
+//
+// Asking politely in the prompt gets you most of the way; it does not get you all of the way,
+// and what leaks through goes straight into someone's notes. Fenced blocks and a leading "Here
+// is the transcription:" are the two that show up constantly.
+func Clean(text string) string {
+	// Applied until nothing more comes off, because the wrappings combine — "Here is the
+	// transcription:" followed by a fenced block is the single most common shape, and stripping
+	// only one of the two leaves the other in the user's notes. Bounded so a pathological input
+	// cannot spin.
+	for range 4 {
+		stripped := stripOnce(text)
+		if stripped == text {
+			break
+		}
+		text = stripped
+	}
+	return strings.TrimSpace(text)
+}
+
+func stripOnce(text string) string {
+	text = strings.TrimSpace(text)
+
+	// A fenced block, with or without a language tag on the opening fence.
+	if strings.HasPrefix(text, "```") {
+		if end := strings.LastIndex(text, "```"); end > 3 {
+			inner := text[3:end]
+			if newline := strings.IndexByte(inner, '\n'); newline >= 0 {
+				first := strings.TrimSpace(inner[:newline])
+				// Only treat the first line as a tag if it is one word — a fence opened as
+				// "```\nmilk, eggs" must not lose the milk.
+				if first == "" || (!strings.ContainsAny(first, " \t") && len(first) < 20) {
+					inner = inner[newline+1:]
+				}
+			}
+			text = strings.TrimSpace(inner)
+		}
+	}
+
+	// A preamble on its own first line, of the "Here is ...:" shape. Only removed when the line
+	// ends in a colon and something follows it, so a note that genuinely begins with a sentence
+	// about transcription survives.
+	if newline := strings.IndexByte(text, '\n'); newline > 0 {
+		first := strings.TrimSpace(text[:newline])
+		lower := strings.ToLower(first)
+		if strings.HasSuffix(first, ":") && len(first) < 80 {
+			for _, opener := range []string{"here is", "here's", "the text", "transcription", "transcribed"} {
+				if strings.HasPrefix(lower, opener) {
+					text = strings.TrimSpace(text[newline+1:])
+					break
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(text)
+}
