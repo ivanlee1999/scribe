@@ -76,11 +76,12 @@ func run(once, check bool) error {
 	}
 
 	w := worker.New(client, model, worker.NewFileStore(cfg.StatePath), worker.Config{
-		NotesDatabase: cfg.NotesDatabase,
-		TextDatabase:  cfg.TextDatabase,
-		DeviceID:      cfg.DeviceID,
-		Poll:          cfg.Poll,
-		Batch:         cfg.Batch,
+		NotesDatabase:  cfg.NotesDatabase,
+		TextDatabase:   cfg.TextDatabase,
+		ImagesDatabase: cfg.ImagesDatabase,
+		DeviceID:       cfg.DeviceID,
+		Poll:           cfg.Poll,
+		Batch:          cfg.Batch,
 	}, log)
 
 	if once {
@@ -99,11 +100,16 @@ func run(once, check bool) error {
 // databases exist. Failing here with a clear message beats a change feed that silently returns
 // nothing for a week.
 func preflight(ctx context.Context, client *couch.Client, cfg config.Config, log *slog.Logger) error {
-	for _, database := range []string{cfg.NotesDatabase, cfg.TextDatabase} {
+	databases := []string{cfg.NotesDatabase, cfg.TextDatabase}
+	if cfg.ImagesDatabase != "" {
+		databases = append(databases, cfg.ImagesDatabase)
+	}
+	for _, database := range databases {
 		if err := client.Ping(ctx, database); err != nil {
 			return fmt.Errorf("cannot reach database %q: %w", database, err)
 		}
 	}
-	log.Info("both databases are reachable", "notes", cfg.NotesDatabase, "text", cfg.TextDatabase)
+	log.Info("databases are reachable", "notes", cfg.NotesDatabase, "text", cfg.TextDatabase,
+		"images", cfg.ImagesDatabase)
 	return nil
 }

@@ -15,6 +15,9 @@ type Config struct {
 	CouchPassword string
 	NotesDatabase string
 	TextDatabase  string
+	// ImagesDatabase holds the rendered ink, one document per page. Empty disables it, and
+	// nothing else changes — the text is unaffected either way.
+	ImagesDatabase string
 
 	ModelURL  string
 	ModelKey  string
@@ -35,11 +38,12 @@ type Config struct {
 // Load reads the environment, filling in defaults and rejecting a configuration that cannot work.
 func Load() (Config, error) {
 	cfg := Config{
-		CouchURL:      os.Getenv("SCRIBE_COUCH_URL"),
-		CouchUser:     os.Getenv("SCRIBE_COUCH_USER"),
-		CouchPassword: os.Getenv("SCRIBE_COUCH_PASSWORD"),
-		NotesDatabase: envOr("SCRIBE_NOTES_DB", "notes"),
-		TextDatabase:  envOr("SCRIBE_TEXT_DB", "notes_text"),
+		CouchURL:       os.Getenv("SCRIBE_COUCH_URL"),
+		CouchUser:      os.Getenv("SCRIBE_COUCH_USER"),
+		CouchPassword:  os.Getenv("SCRIBE_COUCH_PASSWORD"),
+		NotesDatabase:  envOr("SCRIBE_NOTES_DB", "notes"),
+		TextDatabase:   envOr("SCRIBE_TEXT_DB", "notes_text"),
+		ImagesDatabase: os.Getenv("SCRIBE_IMAGES_DB"),
 
 		ModelURL:      envOr("SCRIBE_MODEL_URL", "http://127.0.0.1:11434/v1"),
 		ModelKey:      os.Getenv("SCRIBE_MODEL_KEY"),
@@ -93,6 +97,7 @@ func (c Config) Redacted() []any {
 		"couch", redactURL(c.CouchURL),
 		"notes", c.NotesDatabase,
 		"text", c.TextDatabase,
+		"images", c.ImagesDatabase,
 		"model", c.ModelName,
 		"strongModel", c.ModelStrong,
 		"modelURL", redactURL(c.ModelURL),

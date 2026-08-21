@@ -136,3 +136,39 @@ func supersedes(local, remote PageText) bool {
 	}
 	return localRun > remoteRun
 }
+
+// PageImage is the rendered ink of one page, stored so that a reader can see the writing beside
+// the text it was read as. The two are separate documents in separate databases on purpose: the
+// tablets replicate the text and have the ink already, and none of them should be made to pull
+// back a picture of what they drew.
+//
+// The PNG rides as an inline attachment, which is CouchDB's own mechanism for binary content and
+// keeps an image inseparable from the metadata describing it.
+type PageImage struct {
+	ID         string `json:"_id"`
+	Rev        string `json:"_rev,omitempty"`
+	PageID     string `json:"pageId"`
+	NotebookID string `json:"notebookId,omitempty"`
+	// Width and Height are the rendered pixels, so a reader can size an embed without decoding.
+	Width  int `json:"width"`
+	Height int `json:"height"`
+	// RenderedClock is the page's own updatedAt at the moment the ink was drawn, exactly as
+	// RecognizedClock is for the text. It is what makes an image comparable against the page.
+	RenderedClock string `json:"renderedClock"`
+	UpdatedAt     string `json:"updatedAt"`
+	UpdatedBy     string `json:"updatedBy"`
+
+	Attachments map[string]Attachment `json:"_attachments,omitempty"`
+}
+
+// Attachment is one inline CouchDB attachment: base64 in, base64 out.
+type Attachment struct {
+	ContentType string `json:"content_type"`
+	Data        string `json:"data"`
+}
+
+// ImageAttachmentName is the attachment every PageImage carries its PNG under. Fixed rather than
+// derived, so a reader can build the URL without first fetching the document.
+const ImageAttachmentName = "page.png"
+
+func pageImageID(pageID string) string { return "pageimage:" + pageID }

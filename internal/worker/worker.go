@@ -19,6 +19,8 @@ import (
 type Config struct {
 	NotesDatabase string
 	TextDatabase  string
+	// ImagesDatabase holds the rendered ink. Empty disables storing it at all.
+	ImagesDatabase string
 	// DeviceID identifies this server in the documents it writes. It must differ from the
 	// tablets' "boox" and "ipad" so a reader can tell who wrote what.
 	DeviceID string
@@ -148,6 +150,11 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 	}
 
 	if haveExisting && !stale(page.UpdatedAt, existing.RecognizedClock) {
+		// The text is current, but the image may not be: an images database can be turned on
+		// long after the text was read, and a failed upload leaves a gap behind. Rendering is
+		// local and costs milliseconds; recognizing is neither, so the picture is caught up on
+		// its own rather than by paying to read the page a second time.
+		w.backfillImage(ctx, page, pageID)
 		return nil
 	}
 
@@ -161,10 +168,20 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 		return err
 	}
 
-	result, err := w.read(ctx, strokes, page)
+	image, err := render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
+	if err != nil {
+		return fmt.Errorf("rendering: %w", err)
+	}
+
+	result, err := w.read(ctx, image, page)
 	if err != nil {
 		return err
 	}
+
+	// Before the text's own supersede check, because the image is ours regardless of whose text
+	// wins: a page whose text another writer already described better is still a page someone
+	// may want to look at.
+	w.publishImage(ctx, image, page, pageID, clock)
 
 	text := PageText{
 		ID:              textID,
@@ -214,12 +231,12 @@ func (w *Worker) decode(page Page) ([]render.Stroke, error) {
 	return strokes, nil
 }
 
-// read renders the ink and hands it to the model.
-func (w *Worker) read(ctx context.Context, strokes []render.Stroke, page Page) (recognize.Result, error) {
-	image, err := render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
-	if err != nil {
-		return recognize.Result{}, fmt.Errorf("rendering: %w", err)
-	}
+// read hands an already-rendered page to the model.
+//
+// The rendering happens in handlePage rather than here so that the caller keeps the PNG: it is
+// the same image a reader wants beside the text, and rendering it twice to have it in both
+// places would be the most expensive way to avoid passing an argument.
+func (w *Worker) read(ctx context.Context, image render.Result, page Page) (recognize.Result, error) {
 	if image.Empty {
 		// Recorded as recognized-and-empty rather than skipped, so the page stops being
 		// revisited on every pass and readers can tell "blank" from "not looked at yet".
@@ -237,6 +254,72 @@ func (w *Worker) read(ctx context.Context, strokes []render.Stroke, page Page) (
 		"chars", len(result.Text),
 		"took", time.Since(started).Round(time.Millisecond))
 	return result, nil
+}
+
+// backfillImage renders and stores a page whose text is already current but whose image is
+// missing or older than the ink. It never calls the model.
+func (w *Worker) backfillImage(ctx context.Context, page Page, pageID string) {
+	if w.cfg.ImagesDatabase == "" {
+		return
+	}
+
+	var existing PageImage
+	err := w.couch.Get(ctx, w.cfg.ImagesDatabase, pageImageID(pageID), &existing)
+	switch {
+	case err == nil && !stale(page.UpdatedAt, existing.RenderedClock):
+		return
+	case err != nil && !errors.Is(err, couch.ErrNotFound):
+		w.log.Warn("could not read the existing image", "page", page.ID, "error", err)
+		return
+	}
+
+	strokes, err := w.decode(page)
+	if err != nil {
+		w.log.Warn("could not decode for an image", "page", page.ID, "error", err)
+		return
+	}
+	image, err := render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
+	if err != nil {
+		w.log.Warn("could not render an image", "page", page.ID, "error", err)
+		return
+	}
+	w.publishImage(ctx, image, page, pageID, page.UpdatedAt)
+}
+
+// publishImage stores the rendered ink beside its text, when an images database is configured.
+//
+// Deliberately best-effort and never returned as an error: the text is what this service exists
+// to produce, and a picture that failed to upload must not cost a page its reading. A page that
+// fails here is re-rendered the next time its ink changes, which is the only time the image is
+// out of date anyway.
+func (w *Worker) publishImage(ctx context.Context, image render.Result, page Page, pageID, clock string) {
+	if w.cfg.ImagesDatabase == "" || image.Empty {
+		return
+	}
+
+	id := pageImageID(pageID)
+	var existing PageImage
+	if err := w.couch.Get(ctx, w.cfg.ImagesDatabase, id, &existing); err != nil && !errors.Is(err, couch.ErrNotFound) {
+		w.log.Warn("could not read the existing image", "page", page.ID, "error", err)
+		return
+	}
+
+	if _, err := w.couch.Put(ctx, w.cfg.ImagesDatabase, id, PageImage{
+		ID:            id,
+		Rev:           existing.Rev,
+		PageID:        pageID,
+		NotebookID:    page.NotebookID,
+		Width:         image.Width,
+		Height:        image.Height,
+		RenderedClock: clock,
+		UpdatedAt:     nowStamp(),
+		UpdatedBy:     w.cfg.DeviceID,
+		Attachments: map[string]Attachment{
+			ImageAttachmentName: {ContentType: "image/png", Data: base64.StdEncoding.EncodeToString(image.PNG)},
+		},
+	}); err != nil {
+		w.log.Warn("could not store the image", "page", page.ID, "error", err)
+	}
 }
 
 // publish writes the text, re-checking the guard if someone got there first.
