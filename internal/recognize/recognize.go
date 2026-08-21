@@ -185,7 +185,46 @@ func Clean(text string) string {
 		}
 		text = stripped
 	}
-	return strings.TrimSpace(text)
+	text = strings.TrimSpace(text)
+
+	// A page holding only a drawing or a scribble has no text, and the prompt asks for silence
+	// in that case. Models mostly comply and not reliably, so the refusal is discarded here
+	// instead — a sentence of commentary published as a page's text reads in the vault as
+	// though the user had written it.
+	if describesAnAbsenceOfText(text) {
+		return ""
+	}
+	return text
+}
+
+// describesAnAbsenceOfText reports whether the model answered "there is nothing to read here"
+// in prose rather than the silence the prompt asks for.
+//
+// Both halves are required — a reference to the image AND a claim that it holds no text —
+// because either alone occurs in real notes. "no text" turns up in a note about a bug; a page
+// about file formats mentions images. Together, in one short block, it is a model describing
+// the page instead of transcribing it. The length and line bounds keep a long note that
+// happens to discuss both from being thrown away.
+func describesAnAbsenceOfText(text string) bool {
+	if text == "" || len(text) > 400 || strings.Count(text, "\n") > 2 {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "image") && !strings.Contains(lower, "picture") {
+		return false
+	}
+	for _, claim := range []string{
+		"no handwriting", "no handwritten", "no legible", "no text", "no readable",
+		"no transcribable", "nothing to transcribe", "not handwriting",
+		"don't see any", "do not see any", "cannot identify any", "unable to identify",
+		"cannot be transcribed", "cannot be reliably transcribed",
+		"do not form legible", "does not contain any text",
+	} {
+		if strings.Contains(lower, claim) {
+			return true
+		}
+	}
+	return false
 }
 
 func stripOnce(text string) string {
