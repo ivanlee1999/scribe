@@ -58,6 +58,11 @@ func TestCleanDiscardsCommentaryAboutAnEmptyPage(t *testing.T) {
 		// A second backfill pass turned up this phrasing, which the first list did not cover.
 		"I don't see any legible handwriting text in this image. The image appears to contain only a simple curved line.",
 		"I don't see any handwriting in this image. The image contains only a simple black wavy line or squiggle.",
+		// A third pass turned up qualifiers a phrase list could not have anticipated — "no
+		// *actual* handwriting", "*not* legible text" — which is why this matches patterns now.
+		"This image contains only a simple line drawing or sketch with no actual handwriting to transcribe.",
+		"This image contains only a handwritten signature or stylized mark, not legible text that can be transcribed as words.",
+		"The image does not contain any readable handwritten words.",
 	} {
 		t.Run(in[:32], func(t *testing.T) {
 			if got := Clean(in); got != "" {

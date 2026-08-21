@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -213,19 +214,23 @@ func describesAnAbsenceOfText(text string) bool {
 	if !strings.Contains(lower, "image") && !strings.Contains(lower, "picture") {
 		return false
 	}
-	for _, claim := range []string{
-		"no handwriting", "no handwritten", "no legible", "no text", "no readable",
-		"no transcribable", "nothing to transcribe", "not handwriting",
-		"don't see any", "do not see any", "cannot identify any", "unable to identify",
-		"cannot be transcribed", "cannot be reliably transcribed",
-		"do not form legible", "does not contain any text",
-	} {
-		if strings.Contains(lower, claim) {
-			return true
-		}
-	}
-	return false
+	return absenceClaim.MatchString(lower)
 }
+
+// absenceClaim matches the ways a model says a page holds nothing to read.
+//
+// Patterns rather than a list of phrases, because the phrasings are endless and a list only ever
+// covers the ones already seen: three backfills over one library produced "no handwriting", then
+// "I don't see any handwriting", then "no *actual* handwriting" and "*not* legible text" — each
+// one slipping past a list built from the last. The qualifier slots are what make the difference.
+var absenceClaim = regexp.MustCompile(strings.Join([]string{
+	`\bno\s+(?:\w+\s+){0,3}(?:handwriting|handwritten|text|words|writing|characters)\b`,
+	`\bnot\s+(?:\w+\s+){0,3}(?:legible|handwriting|handwritten|text)\b`,
+	`\b(?:don't|do not|cannot|can't|could not|couldn't|unable to)\s+(?:\w+\s+){0,3}` +
+		`(?:see|find|identify|read|transcribe|discern|make out)\b`,
+	`\bnothing\s+to\s+(?:transcribe|read)\b`,
+	`\bdo(?:es)? not (?:appear to )?contain\b`,
+}, "|"))
 
 func stripOnce(text string) string {
 	text = strings.TrimSpace(text)
