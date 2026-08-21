@@ -45,6 +45,47 @@ func TestCleanStripsWhatModelsWrapAroundTranscriptions(t *testing.T) {
 	}
 }
 
+func TestCleanDiscardsCommentaryAboutAnEmptyPage(t *testing.T) {
+	// A page of pure drawing gets described rather than transcribed, however plainly the prompt
+	// asks for silence. These are verbatim answers from a backfill over a real library.
+	for _, in := range []string{
+		"There is no handwriting in this image. The image contains only a simple line drawing with curved and wavy lines.",
+		"This image contains only line drawings/sketches with no handwritten text to transcribe.",
+		"This image contains only a simple line drawing or sketch, not handwriting. There is no text to transcribe.",
+		"This image contains only handwritten marks and lines that do not form legible text or words. There is no transcribable handwriting content.",
+		"This image contains only handwritten scribbles/marks and no legible text to transcribe.",
+		"There is no handwriting in this image. The image contains only a curved line drawing, not text.",
+		// A second backfill pass turned up this phrasing, which the first list did not cover.
+		"I don't see any legible handwriting text in this image. The image appears to contain only a simple curved line.",
+		"I don't see any handwriting in this image. The image contains only a simple black wavy line or squiggle.",
+	} {
+		t.Run(in[:32], func(t *testing.T) {
+			if got := Clean(in); got != "" {
+				t.Errorf("Clean(%q) = %q, want %q", in, got, "")
+			}
+		})
+	}
+}
+
+func TestCleanKeepsNotesThatMerelyMentionImagesOrText(t *testing.T) {
+	// The discard needs both halves and a short block, so that the user's own writing about
+	// images, or about missing text, survives.
+	for _, tc := range []struct {
+		name, in string
+	}{
+		{"a note about an image with no absence claim", "the image pipeline resizes to 1568px"},
+		{"an absence claim with no image", "no text came back from the parser"},
+		{"a real note using both words at length", "image formats:\npng is lossless\nno text is stored in exif\njpeg is not\nwebp is smaller\navif is smallest"},
+		{"a short note about a missing alt text", "alt text on the image is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Clean(tc.in); got != tc.in {
+				t.Errorf("Clean(%q) = %q, want it unchanged", tc.in, got)
+			}
+		})
+	}
+}
+
 func TestCleanDoesNotEatTheUsersOwnWriting(t *testing.T) {
 	// The stripping has to be conservative in the other direction too. Someone's note that
 	// happens to begin with a colon-ended line, or to contain the word transcription, is still
