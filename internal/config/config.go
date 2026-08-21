@@ -16,9 +16,11 @@ type Config struct {
 	NotesDatabase string
 	TextDatabase  string
 
-	ModelURL      string
-	ModelKey      string
-	ModelName     string
+	ModelURL  string
+	ModelKey  string
+	ModelName string
+	// ModelStrong re-reads pages the main model appears to have fumbled. Empty disables it.
+	ModelStrong   string
 	ModelPrompt   string
 	ModelTimeout  time.Duration
 	ModelLanguage string
@@ -42,6 +44,7 @@ func Load() (Config, error) {
 		ModelURL:      envOr("SCRIBE_MODEL_URL", "http://127.0.0.1:11434/v1"),
 		ModelKey:      os.Getenv("SCRIBE_MODEL_KEY"),
 		ModelName:     os.Getenv("SCRIBE_MODEL"),
+		ModelStrong:   os.Getenv("SCRIBE_MODEL_STRONG"),
 		ModelPrompt:   os.Getenv("SCRIBE_PROMPT"),
 		ModelLanguage: envOr("SCRIBE_LANGUAGE", "en"),
 
@@ -72,6 +75,10 @@ func Load() (Config, error) {
 	if cfg.ModelName == "" {
 		return cfg, fmt.Errorf("SCRIBE_MODEL is required (the model name your server exposes)")
 	}
+	// Escalating to the same model would double the bill to be told the same thing twice.
+	if cfg.ModelStrong == cfg.ModelName {
+		cfg.ModelStrong = ""
+	}
 	// The tablets write "boox" and "ipad". Sharing an id with one of them would make the two
 	// writers indistinguishable in the documents, which is the one thing a reader needs.
 	if cfg.DeviceID == "boox" || cfg.DeviceID == "ipad" {
@@ -87,6 +94,7 @@ func (c Config) Redacted() []any {
 		"notes", c.NotesDatabase,
 		"text", c.TextDatabase,
 		"model", c.ModelName,
+		"strongModel", c.ModelStrong,
 		"modelURL", redactURL(c.ModelURL),
 		"deviceID", c.DeviceID,
 		"poll", c.Poll,
