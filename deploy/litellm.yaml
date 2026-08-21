@@ -1,0 +1,18 @@
+# Translates the OpenAI-compatible /chat/completions that scribe speaks into Anthropic's
+# Messages API. scribe is unchanged and unaware — it just points SCRIBE_MODEL_URL here.
+#
+# The model scribe asks for is "haiku"; swapping which Claude model that maps to is a change
+# on this line alone, with no scribe restart needed beyond picking up the new answer.
+model_list:
+  - model_name: haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  # Kept configured so a quality comparison is a one-word change to SCRIBE_MODEL.
+  - model_name: sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true

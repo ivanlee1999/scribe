@@ -21,8 +21,9 @@ services:
       SCRIBE_COUCH_PASSWORD: ${SCRIBE_COUCH_PASSWORD}
       SCRIBE_NOTES_DB: ${SCRIBE_NOTES_DB:-notes}
       SCRIBE_TEXT_DB: ${SCRIBE_TEXT_DB:-notes_text}
-      SCRIBE_MODEL_URL: ${SCRIBE_MODEL_URL:-http://model:11434/v1}
+      SCRIBE_MODEL_URL: ${SCRIBE_MODEL_URL:-http://model:4000/v1}
       SCRIBE_MODEL: ${SCRIBE_MODEL}
+      SCRIBE_MODEL_STRONG: ${SCRIBE_MODEL_STRONG:-}
       SCRIBE_MODEL_TIMEOUT: ${SCRIBE_MODEL_TIMEOUT:-5m}
       SCRIBE_LANGUAGE: ${SCRIBE_LANGUAGE:-en}
       SCRIBE_DEVICE_ID: ${SCRIBE_DEVICE_ID:-server}
@@ -37,22 +38,31 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Ollama serves an OpenAI-compatible API at /v1, which is what scribe speaks. Swap this for
-  # llama.cpp's server, vLLM, or an OpenVINO-backed one without touching scribe — point
-  # SCRIBE_MODEL_URL somewhere else and it neither knows nor cares.
+  # scribe speaks OpenAI /chat/completions; litellm translates that to Anthropic's Messages
+  # API. scribe is unchanged and unaware — swapping which model answers is a line in
+  # litellm.yaml, and swapping back to a local model is a change to SCRIBE_MODEL_URL.
   #
-  # On an N100 the iGPU is reachable through OpenVINO rather than through Ollama, so this
-  # container runs on the CPU. That is fine for overnight batches and hopeless for anything
-  # interactive; see the README before expecting speed.
+  # The N100's CPU needs ~10 minutes per page for a 3B local vision model and reads cursive
+  # badly; Haiku answers in ~1.5s. See the README on why the iGPU does not close that gap.
+  #
+  # To go back to a local model instead, restore the ollama service from git history and point
+  # SCRIBE_MODEL_URL at http://model:11434/v1.
   model:
-    image: ollama/ollama:latest
-    container_name: scribe-model
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: scribe-litellm
     restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      # Read by litellm, never by scribe. Lives in .env, which is gitignored.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     volumes:
-      - model-cache:/root/.ollama
-    # Uncomment to hand the iGPU to a runtime that can use it.
-    # devices:
-    #   - /dev/dri:/dev/dri
+      - ./litellm.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     logging:
       driver: json-file
       options:
@@ -61,4 +71,3 @@ services:
 
 volumes:
   scribe-state:
-  model-cache:
