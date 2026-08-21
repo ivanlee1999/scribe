@@ -47,8 +47,19 @@ func run(once, check bool) error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	client := couch.New(cfg.CouchURL, cfg.CouchUser, cfg.CouchPassword)
-	model := recognize.NewVisionModel(
-		cfg.ModelURL, cfg.ModelKey, cfg.ModelName, cfg.ModelPrompt, cfg.ModelLanguage, cfg.ModelTimeout)
+	// A cascade with no strong model behaves exactly like the single model, so the wiring is the
+	// same either way and SCRIBE_MODEL_STRONG stays genuinely optional.
+	var strong recognize.Recognizer
+	if cfg.ModelStrong != "" {
+		strong = recognize.NewVisionModel(
+			cfg.ModelURL, cfg.ModelKey, cfg.ModelStrong, cfg.ModelPrompt, cfg.ModelLanguage, cfg.ModelTimeout)
+	}
+	model := &recognize.Cascade{
+		First: recognize.NewVisionModel(
+			cfg.ModelURL, cfg.ModelKey, cfg.ModelName, cfg.ModelPrompt, cfg.ModelLanguage, cfg.ModelTimeout),
+		Strong: strong,
+		Log:    log,
+	}
 
 	// Cancelled on SIGINT/SIGTERM so a container stop finishes the page in hand rather than
 	// killing it half-published.
