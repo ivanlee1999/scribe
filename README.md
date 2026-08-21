@@ -39,15 +39,20 @@ no such gap: Vision is already reading a bitmap, so a better model here genuinel
 cd deploy
 cp .env.example .env && $EDITOR .env
 docker compose up -d
-docker compose exec model ollama pull qwen2.5vl:3b   # or whatever you configured
 docker compose run --rm scribe -check                # credentials and databases
 ```
 
-`-check` verifies both databases are reachable and exits. `-once` takes a single batch and
-exits, which is the way to watch a first run before letting it loose on the whole library.
+The compose file runs a litellm sidecar as the `model` service, which presents the
+OpenAI-compatible endpoint scribe speaks and forwards to whatever `deploy/litellm.yaml` maps.
+Point `SCRIBE_MODEL_URL` elsewhere to use a different server; nothing in scribe changes either way.
 
-The first run reads every page in the library. That is the backfill, and on a 6W machine it is
-an overnight job — plan for it rather than watching it.
+`-check` verifies both databases are reachable and exits. `-once` takes a single batch and
+exits, which is the way to watch a first run before letting it loose on the whole library —
+though note that a batch is `SCRIBE_BATCH` changes, 200 by default, so on a first run that is
+the whole library rather than a taste of it.
+
+The first run reads every page in the library. That is the backfill. Against a hosted model it
+is a couple of minutes; against a 3B model on a 6W CPU it is an overnight job.
 
 ### Settings
 
@@ -59,6 +64,7 @@ an overnight job — plan for it rather than watching it.
 | `SCRIBE_TEXT_DB` | `notes_text` | read and written |
 | `SCRIBE_MODEL_URL` | `http://127.0.0.1:11434/v1` | any OpenAI-compatible server |
 | `SCRIBE_MODEL` | — | required; a model that server actually has |
+| `SCRIBE_MODEL_STRONG` | — | optional; re-reads what `SCRIBE_MODEL` appears to have fumbled |
 | `SCRIBE_MODEL_TIMEOUT` | `5m` | a timeout that fires mid-read costs the whole page |
 | `SCRIBE_DEVICE_ID` | `server` | must differ from `boox` and `ipad` |
 | `SCRIBE_POLL` | `30s` | wait when the feed is quiet |
@@ -82,6 +88,26 @@ first:
 
 Expect tens of seconds per page on this hardware. That is fine for a batch and useless for
 anything interactive, which is why nothing here is on a request path.
+
+### Two models, and when the second one runs
+
+Set `SCRIBE_MODEL_STRONG` and every page is read by `SCRIBE_MODEL` first, with a second reading
+only for pages whose first answer carries a sign of having gone wrong: non-Latin script, a
+decoder stuck repeating itself, or the `[?]` markers the prompt asks for where a word is
+illegible. Most pages never escalate, so the bill stays near the cheap model's.
+
+What it is guarding against is not a model returning nothing. It is a small model handed
+handwriting it cannot read returning fluent, confident, invented text — which in a vault is
+worse than a gap, because afterwards nothing about it looks like an error. A 3B model asked to
+read a line of Chinese here produced a grammatical sentence about a sister and her brother that
+appears nowhere on the page.
+
+Note the limit: the signals are all visible in the answer alone, so this catches a model that
+*shows* it is struggling. It does not catch a confidently wrong reading of Latin script — a
+misread date comes back looking exactly like a correct one. If that matters more than the cost,
+make the better model `SCRIBE_MODEL` and leave `SCRIBE_MODEL_STRONG` empty.
+
+The `engine` field on each document records which model actually produced it.
 
 The prompt is configurable via `SCRIBE_PROMPT`. The default is blunt on purpose — left to
 themselves these models editorialize, and "The image shows handwritten notes that appear to
