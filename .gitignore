@@ -1,3 +1,6 @@
 /scribe
 /dist/
 *.png
+
+# Credentials. deploy/.env holds the real sync password.
+.env
