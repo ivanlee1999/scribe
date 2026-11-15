@@ -3,6 +3,7 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ import (
 type Config struct {
 	NotesDatabase string
 	TextDatabase  string
-	// ImagesDatabase holds the rendered ink. Empty disables storing it at all.
+	// ImagesDatabase holds rendered ink; empty disables it.
 	ImagesDatabase string
 	// DeviceID identifies this server in the documents it writes. It must differ from the
 	// tablets' "boox" and "ipad" so a reader can tell who wrote what.
@@ -31,12 +32,14 @@ type Config struct {
 	// MaxPageBytes refuses pages larger than this rather than trying to hold them. A page of
 	// dense ink runs to megabytes and this is a 6W machine.
 	MaxPageBytes int
+	// Quiet delays recognition after the last observed edit; negative disables it in batch tests.
+	Quiet time.Duration
 }
 
-// Store persists the change-feed checkpoint across restarts.
+// Store persists the checkpoint and unfinished jobs together.
 type Store interface {
-	Checkpoint() (string, error)
-	SetCheckpoint(seq string) error
+	Load() (State, error)
+	Save(State) error
 }
 
 type Worker struct {
@@ -45,6 +48,7 @@ type Worker struct {
 	store      Store
 	cfg        Config
 	log        *slog.Logger
+	now        func() time.Time
 }
 
 func New(client *couch.Client, recognizer recognize.Recognizer, store Store, cfg Config, log *slog.Logger) *Worker {
@@ -57,7 +61,13 @@ func New(client *couch.Client, recognizer recognize.Recognizer, store Store, cfg
 	if cfg.MaxPageBytes <= 0 {
 		cfg.MaxPageBytes = 32 << 20
 	}
-	return &Worker{couch: client, recognizer: recognizer, store: store, cfg: cfg, log: log}
+	if cfg.Quiet == 0 {
+		cfg.Quiet = 5 * time.Second
+	}
+	if cfg.Quiet < 0 {
+		cfg.Quiet = 0
+	}
+	return &Worker{couch: client, recognizer: recognizer, store: store, cfg: cfg, log: log, now: time.Now}
 }
 
 // Run follows the library until the context is cancelled.
@@ -77,54 +87,106 @@ func (w *Worker) Run(ctx context.Context) error {
 		if worked && err == nil {
 			continue
 		}
+		wait := w.cfg.Poll
+		if err == nil {
+			if state, loadErr := w.store.Load(); loadErr == nil {
+				for _, job := range state.Pending {
+					due := time.UnixMilli(job.DueAt).Sub(w.now())
+					if due < 0 {
+						due = 0
+					}
+					if due < wait {
+						wait = due
+					}
+				}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(w.cfg.Poll):
+		case <-time.After(wait):
 		}
 	}
 }
 
-// Once takes one batch of changes, returning whether there may be more.
-//
-// The checkpoint moves only after the batch is fully handled, so an interruption re-reads rather
-// than skips. Re-reading is cheap and idempotent — the staleness check finds nothing to do — and
-// skipping would leave a page silently unrecognized forever.
+// Once first durably queues a feed batch, then processes at most one settled page.
+// A full feed batch is drained before inference so a backlog coalesces to latest pages.
 func (w *Worker) Once(ctx context.Context) (bool, error) {
-	since, err := w.store.Checkpoint()
+	state, err := w.store.Load()
 	if err != nil {
-		return false, fmt.Errorf("reading checkpoint: %w", err)
+		return false, fmt.Errorf("reading state: %w", err)
 	}
-
-	last, changes, err := w.couch.Changes(ctx, w.cfg.NotesDatabase, since, w.cfg.Batch)
+	if state.PipelineVersion != w.pipelineVersion() {
+		state.Seq = "0" // One idempotent backfill when configuration changes.
+		state.PipelineVersion = w.pipelineVersion()
+	}
+	last, changes, err := w.couch.Changes(ctx, w.cfg.NotesDatabase, state.Seq, w.cfg.Batch)
 	if err != nil {
 		return false, fmt.Errorf("reading changes: %w", err)
 	}
-	if len(changes) == 0 {
-		return false, nil
-	}
-
 	for _, change := range changes {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		if !isPageID(change.ID) || change.Deleted {
-			// A deleted page's text is left where it is. Nothing reads text for a page it does
-			// not have, and the Obsidian plugin — which holds the whole library — prunes it.
+		if !isPageID(change.ID) {
 			continue
 		}
-		if err := w.handlePage(ctx, change.ID); err != nil {
-			// One bad page must not stop the feed. Its change is behind the checkpoint after
-			// this, so it is retried the next time the page is edited rather than immediately —
-			// which is the right trade for a failure that is usually about that page's content.
-			w.log.Error("page failed", "page", change.ID, "error", err)
+		if change.Deleted {
+			delete(state.Pending, change.ID)
+			continue
+		}
+		state.Pending[change.ID] = Pending{DueAt: w.now().Add(w.cfg.Quiet).UnixMilli()}
+	}
+	state.Seq = last
+	if err := w.store.Save(state); err != nil {
+		return false, fmt.Errorf("queuing changes: %w", err)
+	}
+	if len(changes) == w.cfg.Batch {
+		return true, nil
+	}
+	var pageID string
+	var job Pending
+	for id, candidate := range state.Pending {
+		if candidate.DueAt <= w.now().UnixMilli() && (pageID == "" || candidate.DueAt < job.DueAt || (candidate.DueAt == job.DueAt && id < pageID)) {
+			pageID, job = id, candidate
 		}
 	}
-
-	if err := w.store.SetCheckpoint(last); err != nil {
-		return false, fmt.Errorf("saving checkpoint: %w", err)
+	if pageID == "" {
+		return false, nil
 	}
-	return len(changes) == w.cfg.Batch, nil
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := w.handlePage(ctx, pageID); err != nil {
+		if errors.Is(err, errSourceChanged) {
+			job = Pending{DueAt: w.now().Add(w.cfg.Quiet).UnixMilli()}
+		} else {
+			job.Attempts++
+			backoff := 10 * time.Second
+			for i := 1; i < job.Attempts && backoff < 5*time.Minute; i++ {
+				backoff *= 2
+			}
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			job.DueAt = w.now().Add(backoff).UnixMilli()
+			w.log.Error("page deferred", "page", pageID, "attempt", job.Attempts, "error", err)
+		}
+		state.Pending[pageID] = job
+	} else {
+		delete(state.Pending, pageID)
+	}
+	if err := w.store.Save(state); err != nil {
+		return false, fmt.Errorf("saving jobs: %w", err)
+	}
+	return len(state.Pending) > 0 && w.cfg.Quiet == 0 && job.Attempts == 0, nil
+}
+
+var errSourceChanged = errors.New("source changed during recognition")
+
+func (w *Worker) pipelineVersion() string {
+	identity := w.recognizer.Engine()
+	if versioned, ok := w.recognizer.(interface{ PipelineVersion() string }); ok {
+		identity = versioned.PipelineVersion()
+	}
+	return fmt.Sprintf("scribe-v2:%x", sha256.Sum256([]byte("render-v1:"+identity)))
 }
 
 // handlePage reads one page if its text has fallen behind its ink.
@@ -149,79 +211,89 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 		haveExisting = false
 	}
 
-	if haveExisting && !stale(page.UpdatedAt, existing.RecognizedClock) {
-		// The text is current, but the image may not be: an images database can be turned on
-		// long after the text was read, and a failed upload leaves a gap behind. Rendering is
-		// local and costs milliseconds; recognizing is neither, so the picture is caught up on
-		// its own rather than by paying to read the page a second time.
-		w.backfillImage(ctx, page, pageID)
+	live, err := w.pageIsLive(ctx, page)
+	if err != nil {
+		return err
+	}
+	if !live {
 		return nil
 	}
-
-	// Read before the ink is decoded, so that ink arriving mid-recognition leaves the page
-	// looking stale afterwards and gets picked up next time. Reading it after would stamp that
-	// ink as already recognized, and it would never be read at all.
-	clock := page.UpdatedAt
-
-	strokes, err := w.decode(page)
-	if err != nil {
+	fingerprint := inkFingerprint(page)
+	pipeline := w.pipelineVersion()
+	// Retain legacy text claiming genuinely newer ink; exact-clock legacy records are upgraded.
+	if haveExisting && existing.SourceFingerprint == "" {
+		oldClock, oldOK := millis(existing.RecognizedClock)
+		pageClock, pageOK := millis(page.UpdatedAt)
+		if oldOK && pageOK && oldClock > pageClock {
+			return nil
+		}
+	}
+	var result recognize.Result
+	var image render.Result
+	if haveExisting && existing.SourceFingerprint == fingerprint && existing.PipelineVersion == pipeline {
+		if existing.SourceRev == page.Rev && existing.PageTitle == page.Title && existing.NotebookID == page.NotebookID {
+			w.backfillImage(ctx, page, pageID)
+			return nil
+		}
+		result = recognize.Result{Text: existing.Text, Engine: existing.Engine, Language: existing.Language}
+	} else {
+		strokes, err := w.decode(page)
+		if err != nil {
+			return err
+		}
+		image, err = render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
+		if err != nil {
+			return fmt.Errorf("rendering: %w", err)
+		}
+		result, err = w.read(ctx, image, page)
+		if err != nil {
+			return err
+		}
+	}
+	var latest Page
+	if err := w.couch.Get(ctx, w.cfg.NotesDatabase, documentID, &latest); err != nil {
+		if errors.Is(err, couch.ErrNotFound) {
+			return nil
+		}
 		return err
 	}
-
-	image, err := render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
-	if err != nil {
-		return fmt.Errorf("rendering: %w", err)
+	if inkFingerprint(latest) != fingerprint || latest.NotebookID != page.NotebookID {
+		return errSourceChanged
 	}
-
-	result, err := w.read(ctx, image, page)
-	if err != nil {
-		return err
-	}
-
-	// Before the text's own supersede check, because the image is ours regardless of whose text
-	// wins: a page whose text another writer already described better is still a page someone
-	// may want to look at.
-	w.publishImage(ctx, image, page, pageID, clock)
-
 	text := PageText{
-		ID:              textID,
-		Rev:             existing.Rev,
-		PageID:          pageID,
-		NotebookID:      page.NotebookID,
-		PageTitle:       page.Title,
-		Text:            result.Text,
-		Engine:          result.Engine,
-		Language:        result.Language,
-		RecognizedClock: clock,
-		UpdatedAt:       nowStamp(),
-		UpdatedBy:       w.cfg.DeviceID,
+		ID: textID, Rev: existing.Rev, PageID: pageID, NotebookID: latest.NotebookID,
+		PageTitle: latest.Title, Text: result.Text, Engine: result.Engine, Language: result.Language,
+		RecognizedClock: latest.UpdatedAt, UpdatedAt: nowStamp(), UpdatedBy: w.cfg.DeviceID,
+		SourceRev: latest.Rev, SourceFingerprint: fingerprint, PipelineVersion: pipeline,
 	}
 
-	if haveExisting && !supersedes(text, existing) {
-		return nil
+	if err := w.validateSource(ctx, text); err != nil {
+		return err
 	}
-
+	if len(image.PNG) > 0 {
+		w.publishImage(ctx, image, latest, pageID, latest.UpdatedAt)
+	} else {
+		w.backfillImage(ctx, latest, pageID)
+	}
 	return w.publish(ctx, text)
 }
 
 // decode turns a page's stroke payloads into geometry.
 func (w *Worker) decode(page Page) ([]render.Stroke, error) {
 	strokes := make([]render.Stroke, 0, len(page.Strokes))
+	total := 0
 	for i, stroke := range page.Strokes {
-		if len(stroke.PointsData) > w.cfg.MaxPageBytes {
-			return nil, fmt.Errorf("stroke %d is %d bytes, over the limit", i, len(stroke.PointsData))
+		total += len(stroke.PointsData)
+		if total > w.cfg.MaxPageBytes {
+			return nil, fmt.Errorf("page stroke payload exceeds %d bytes", w.cfg.MaxPageBytes)
 		}
 		raw, err := base64.StdEncoding.DecodeString(stroke.PointsData)
 		if err != nil {
-			// One unreadable stroke is not a reason to abandon the page: the rest of the
-			// writing is still worth reading.
-			w.log.Warn("skipping unreadable stroke", "page", page.ID, "index", i, "error", err)
-			continue
+			return nil, fmt.Errorf("decoding stroke %d: %w", i, err)
 		}
 		points, err := sb.Decode(raw)
 		if err != nil {
-			w.log.Warn("skipping undecodable stroke", "page", page.ID, "index", i, "error", err)
-			continue
+			return nil, fmt.Errorf("decoding stroke %d: %w", i, err)
 		}
 		if len(points) == 0 {
 			continue
@@ -324,6 +396,9 @@ func (w *Worker) publishImage(ctx context.Context, image render.Result, page Pag
 
 // publish writes the text, re-checking the guard if someone got there first.
 func (w *Worker) publish(ctx context.Context, text PageText) error {
+	if err := w.validateSource(ctx, text); err != nil {
+		return err
+	}
 	status, err := w.couch.Put(ctx, w.cfg.TextDatabase, text.ID, text)
 	if err != nil {
 		return err
@@ -341,8 +416,14 @@ func (w *Worker) publish(ctx context.Context, text PageText) error {
 	if err := w.couch.Get(ctx, w.cfg.TextDatabase, text.ID, &current); err != nil {
 		return err
 	}
-	if !supersedes(text, current) {
+	if current.SourceRev == text.SourceRev && current.SourceFingerprint == text.SourceFingerprint && current.PipelineVersion == text.PipelineVersion && current.Text == text.Text && current.PageTitle == text.PageTitle {
 		return nil
+	}
+	if text.SourceFingerprint == "" && !supersedes(text, current) {
+		return nil
+	}
+	if err := w.validateSource(ctx, text); err != nil {
+		return err
 	}
 	text.Rev = current.Rev
 	status, err = w.couch.Put(ctx, w.cfg.TextDatabase, text.ID, text)
@@ -353,4 +434,76 @@ func (w *Worker) publish(ctx context.Context, text PageText) error {
 		return fmt.Errorf("publishing %s after conflict: status %d", text.ID, status)
 	}
 	return nil
+}
+
+// Readers also compare sourceRev: the source and text databases cannot be updated atomically.
+func (w *Worker) validateSource(ctx context.Context, text PageText) error {
+	var page Page
+	if err := w.couch.Get(ctx, w.cfg.NotesDatabase, "page:"+text.PageID, &page); err != nil {
+		if errors.Is(err, couch.ErrNotFound) {
+			return errSourceChanged
+		}
+		return err
+	}
+	live, err := w.pageIsLive(ctx, page)
+	if err != nil {
+		return err
+	}
+	if !live {
+		return errSourceChanged
+	}
+	if page.Rev != text.SourceRev || inkFingerprint(page) != text.SourceFingerprint || page.NotebookID != text.NotebookID {
+		return errSourceChanged
+	}
+	return nil
+}
+
+// A late result must not resurrect removed pages or notes hidden by Trash.
+func (w *Worker) pageIsLive(ctx context.Context, page Page) (bool, error) {
+	var notebook struct {
+		PageIDs        []string `json:"pageIds"`
+		DeletedAt      *string  `json:"deletedAt"`
+		ParentFolderID string   `json:"parentFolderId"`
+	}
+	if err := w.couch.Get(ctx, w.cfg.NotesDatabase, "notebook:"+page.NotebookID, &notebook); err != nil {
+		if errors.Is(err, couch.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if notebook.DeletedAt != nil && *notebook.DeletedAt != "" {
+		return false, nil
+	}
+	found := false
+	for _, id := range notebook.PageIDs {
+		if id == bareID(page.ID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	seen := map[string]bool{}
+	for id := notebook.ParentFolderID; id != ""; {
+		if seen[id] {
+			return false, fmt.Errorf("folder cycle")
+		}
+		seen[id] = true
+		var folder struct {
+			DeletedAt      *string `json:"deletedAt"`
+			ParentFolderID string  `json:"parentFolderId"`
+		}
+		if err := w.couch.Get(ctx, w.cfg.NotesDatabase, "folder:"+id, &folder); err != nil {
+			if errors.Is(err, couch.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if folder.DeletedAt != nil && *folder.DeletedAt != "" {
+			return false, nil
+		}
+		id = folder.ParentFolderID
+	}
+	return true, nil
 }

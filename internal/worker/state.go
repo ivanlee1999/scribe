@@ -7,11 +7,19 @@ import (
 	"sync"
 )
 
-// FileStore keeps the change-feed checkpoint in one small JSON file.
-//
-// Losing it is survivable rather than fatal: the service replays the library from the beginning,
-// finds every page's text already current, and settles. That costs a scan and no model runs,
-// which is why nothing here works hard to protect it.
+// Pending is one coalesced page job. Failures and their next retry survive restarts.
+type Pending struct {
+	DueAt    int64 `json:"dueAt"`
+	Attempts int   `json:"attempts,omitempty"`
+}
+
+type State struct {
+	Seq             string             `json:"seq"`
+	PipelineVersion string             `json:"pipelineVersion,omitempty"`
+	Pending         map[string]Pending `json:"pending,omitempty"`
+}
+
+// FileStore atomically persists both the feed position and all unfinished work.
 type FileStore struct {
 	path string
 	mu   sync.Mutex
@@ -19,54 +27,52 @@ type FileStore struct {
 
 func NewFileStore(path string) *FileStore { return &FileStore{path: path} }
 
-type state struct {
-	// Seq is a position in one server's change feed. Pointing the service at a different
-	// CouchDB with the same state file would skip everything before that server's own position,
-	// which is why the file belongs beside the deployment rather than in a shared location.
-	Seq string `json:"seq"`
-}
-
-func (s *FileStore) Checkpoint() (string, error) {
+func (s *FileStore) Load() (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// A first run reads the library from the start, which is exactly the backfill.
-			return "0", nil
+	if err != nil && !os.IsNotExist(err) {
+		return State{}, err
+	}
+	var state State
+	if err == nil {
+		if json.Unmarshal(data, &state) != nil {
+			state = State{}
 		}
-		return "", err
 	}
-	var current state
-	if err := json.Unmarshal(data, &current); err != nil {
-		// A truncated or hand-edited file replays rather than stops. See the type comment: a
-		// replay is cheap, and refusing to start is not.
-		return "0", nil
+	// Old checkpoint files upgrade in place; corrupt files safely replay the feed.
+	if state.Seq == "" {
+		state.Seq = "0"
 	}
-	if current.Seq == "" {
-		return "0", nil
+	if state.Pending == nil {
+		state.Pending = map[string]Pending{}
 	}
-	return current.Seq, nil
+	return state, nil
 }
-
-func (s *FileStore) SetCheckpoint(seq string) error {
+func (s *FileStore) Save(state State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(state{Seq: seq})
+	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-
-	// Written to a neighbour and renamed: a half-written checkpoint read on the next start is
-	// the one failure here that is not self-correcting.
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
 		return err
+	}
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	return os.Rename(tmp, s.path)
 }

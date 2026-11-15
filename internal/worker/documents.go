@@ -1,6 +1,9 @@
 package worker
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -12,6 +15,7 @@ import (
 // needed also means a protocol addition cannot break the server by surprise.
 type Page struct {
 	ID         string   `json:"_id"`
+	Rev        string   `json:"_rev"`
 	NotebookID string   `json:"notebookId"`
 	Title      string   `json:"title"`
 	UpdatedAt  string   `json:"updatedAt"`
@@ -31,14 +35,17 @@ type Stroke struct {
 // PageText is a `pagetext:` document — the contract in bopa's docs/recognized-text.md, which the
 // two tablet apps and the Obsidian plugin all implement against.
 type PageText struct {
-	ID         string `json:"_id"`
-	Rev        string `json:"_rev,omitempty"`
-	PageID     string `json:"pageId"`
-	NotebookID string `json:"notebookId,omitempty"`
-	PageTitle  string `json:"pageTitle,omitempty"`
-	Text       string `json:"text"`
-	Engine     string `json:"engine"`
-	Language   string `json:"language,omitempty"`
+	ID                string `json:"_id"`
+	Rev               string `json:"_rev,omitempty"`
+	PageID            string `json:"pageId"`
+	NotebookID        string `json:"notebookId,omitempty"`
+	PageTitle         string `json:"pageTitle,omitempty"`
+	Text              string `json:"text"`
+	SourceRev         string `json:"sourceRev,omitempty"`
+	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
+	PipelineVersion   string `json:"pipelineVersion,omitempty"`
+	Engine            string `json:"engine"`
+	Language          string `json:"language,omitempty"`
 	// RecognizedClock is the page's updatedAt at the moment its ink was read, copied verbatim.
 	// The page moving past it is what makes this text stale.
 	RecognizedClock string `json:"recognizedClock"`
@@ -172,3 +179,16 @@ type Attachment struct {
 const ImageAttachmentName = "page.png"
 
 func pageImageID(pageID string) string { return "pageimage:" + pageID }
+
+// inkFingerprint excludes filing, title, clocks and typed blocks. Array order is rendering order.
+func inkFingerprint(page Page) string {
+	source := struct {
+		Width, Height float32
+		Strokes       []Stroke
+	}{page.PageWidth, page.PageHeight, page.Strokes}
+	if source.Strokes == nil {
+		source.Strokes = []Stroke{}
+	}
+	data, _ := json.Marshal(source)
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+}

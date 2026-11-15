@@ -134,6 +134,7 @@ func (l live) putPage(t *testing.T, pageID, updatedAt string, strokes int) {
 	}
 	page["strokes"] = list
 
+	l.upsert(t, l.notes, "notebook:book-1", map[string]any{"pageIds": []string{pageID}})
 	l.upsert(t, l.notes, "page:"+pageID, page)
 }
 
@@ -175,6 +176,7 @@ func newWorker(t *testing.T, l live, model recognize.Recognizer) *Worker {
 		TextDatabase:  l.text,
 		DeviceID:      "server",
 		Batch:         100,
+		Quiet:         -1,
 	}, log)
 }
 
@@ -374,7 +376,7 @@ func TestTheCheckpointSurvivesARestart(t *testing.T) {
 
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := Config{NotesDatabase: l.notes, TextDatabase: l.text, DeviceID: "server", Batch: 100}
+	cfg := Config{NotesDatabase: l.notes, TextDatabase: l.text, DeviceID: "server", Batch: 100, Quiet: -1}
 	model := &stubModel{text: "milk"}
 
 	first := New(l.client, model, NewFileStore(statePath), cfg, log)
