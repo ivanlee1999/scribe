@@ -236,8 +236,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 	var image render.Result
 	if haveExisting && existing.SourceFingerprint == fingerprint && existing.PipelineVersion == pipeline {
 		if existing.SourceRev == page.Rev && existing.PageTitle == page.Title && existing.NotebookID == page.NotebookID {
-			w.backfillImage(ctx, page, pageID)
-			return nil
+			return w.backfillImage(ctx, page, pageID)
 		}
 		result = recognize.Result{Text: existing.Text, Engine: existing.Engine, Language: existing.Language}
 	} else {
@@ -274,12 +273,15 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 	if err := w.validateSource(ctx, text); err != nil {
 		return err
 	}
-	if len(image.PNG) > 0 {
-		w.publishImage(ctx, image, latest, pageID, latest.UpdatedAt)
-	} else {
-		w.backfillImage(ctx, latest, pageID)
+	// Save successful recognition before trying its image. A retry can then backfill the
+	// image from the same source without paying for recognition again.
+	if err := w.publish(ctx, text); err != nil {
+		return err
 	}
-	return w.publish(ctx, text)
+	if image.Empty || len(image.PNG) > 0 {
+		return w.publishImage(ctx, image, latest, pageID, latest.UpdatedAt)
+	}
+	return w.backfillImage(ctx, latest, pageID)
 }
 
 // decode turns a page's stroke payloads into geometry.
@@ -332,80 +334,67 @@ func (w *Worker) read(ctx context.Context, image render.Result, page Page) (reco
 	return result, nil
 }
 
-// backfillImage renders and stores a page whose text is already current but whose image is
-// missing or older than the ink. It never calls the model.
-func (w *Worker) backfillImage(ctx context.Context, page Page, pageID string) {
+// backfillImage retries missing or outdated ink without calling the model.
+func (w *Worker) backfillImage(ctx context.Context, page Page, pageID string) error {
 	if w.cfg.ImagesDatabase == "" {
-		return
+		return nil
 	}
-
 	var existing PageImage
 	err := w.couch.Get(ctx, w.cfg.ImagesDatabase, pageImageID(pageID), &existing)
 	switch {
 	case err == nil && existing.SourceFingerprint == inkFingerprint(page):
-		return
+		return nil
 	case err != nil && !errors.Is(err, couch.ErrNotFound):
-		w.log.Warn("could not read the existing image", "page", page.ID, "error", err)
-		return
+		return fmt.Errorf("reading page image: %w", err)
 	}
-
 	strokes, err := w.decode(page)
 	if err != nil {
-		w.log.Warn("could not decode for an image", "page", page.ID, "error", err)
-		return
+		return err
 	}
 	image, err := render.Render(strokes, render.DefaultOptions(page.PageWidth, page.PageHeight))
 	if err != nil {
-		w.log.Warn("could not render an image", "page", page.ID, "error", err)
-		return
+		return fmt.Errorf("rendering page image: %w", err)
 	}
-	w.publishImage(ctx, image, page, pageID, page.UpdatedAt)
+	return w.publishImage(ctx, image, page, pageID, page.UpdatedAt)
 }
 
-// publishImage stores the rendered ink beside its text, when an images database is configured.
-//
-// Deliberately best-effort and never returned as an error: the text is what this service exists
-// to produce, and a picture that failed to upload must not cost a page its reading. A page that
-// fails here is re-rendered the next time its ink changes, which is the only time the image is
-// out of date anyway.
-func (w *Worker) publishImage(ctx context.Context, image render.Result, page Page, pageID, clock string) {
+// publishImage errors keep the durable job pending while its successful text remains available.
+func (w *Worker) publishImage(ctx context.Context, image render.Result, page Page, pageID, clock string) error {
 	if w.cfg.ImagesDatabase == "" {
-		return
+		return nil
 	}
-	// Replace an old image after the final stroke is erased, rather than leaving erased ink visible.
+	// Replace erased ink with a blank image rather than leaving the previous writing visible.
 	if image.Empty {
 		blank := imagepkg.NewRGBA(imagepkg.Rect(0, 0, 1, 1))
 		blank.Set(0, 0, color.White)
 		var encoded bytes.Buffer
 		if err := png.Encode(&encoded, blank); err != nil {
-			return
+			return err
 		}
 		image = render.Result{PNG: encoded.Bytes(), Width: 1, Height: 1}
 	}
 	id := pageImageID(pageID)
 	var existing PageImage
 	if err := w.couch.Get(ctx, w.cfg.ImagesDatabase, id, &existing); err != nil && !errors.Is(err, couch.ErrNotFound) {
-		w.log.Warn("could not read the existing image", "page", page.ID, "error", err)
-		return
+		return fmt.Errorf("reading page image: %w", err)
 	}
-
-	if _, err := w.couch.Put(ctx, w.cfg.ImagesDatabase, id, PageImage{
-		ID:            id,
-		Rev:           existing.Rev,
-		PageID:        pageID,
-		NotebookID:    page.NotebookID,
-		Width:         image.Width,
-		Height:        image.Height,
-		RenderedClock: clock,
-		SourceRev:     page.Rev, SourceFingerprint: inkFingerprint(page),
-		UpdatedAt: nowStamp(),
-		UpdatedBy: w.cfg.DeviceID,
-		Attachments: map[string]Attachment{
-			ImageAttachmentName: {ContentType: "image/png", Data: base64.StdEncoding.EncodeToString(image.PNG)},
-		},
-	}); err != nil {
-		w.log.Warn("could not store the image", "page", page.ID, "error", err)
+	fingerprint := inkFingerprint(page)
+	if err := w.validateSource(ctx, PageText{PageID: pageID, NotebookID: page.NotebookID, SourceRev: page.Rev, SourceFingerprint: fingerprint}); err != nil {
+		return err
 	}
+	status, err := w.couch.Put(ctx, w.cfg.ImagesDatabase, id, PageImage{
+		ID: id, Rev: existing.Rev, PageID: pageID, NotebookID: page.NotebookID,
+		Width: image.Width, Height: image.Height, RenderedClock: clock,
+		SourceRev: page.Rev, SourceFingerprint: fingerprint, UpdatedAt: nowStamp(), UpdatedBy: w.cfg.DeviceID,
+		Attachments: map[string]Attachment{ImageAttachmentName: {ContentType: "image/png", Data: base64.StdEncoding.EncodeToString(image.PNG)}},
+	})
+	if err != nil {
+		return fmt.Errorf("publishing page image: %w", err)
+	}
+	if status >= 400 {
+		return fmt.Errorf("publishing page image: status %d", status)
+	}
+	return nil
 }
 
 // publish writes the text, re-checking the guard if someone got there first.

@@ -24,6 +24,8 @@ import (
 
 // Only protocol plumbing is faked; the source decode/render and durable state are real.
 type queueFixture struct {
+	imagePutStatus    int
+	imagePutAttempts  int
 	conflictText      *PageText
 	mu                sync.Mutex
 	page              Page
@@ -92,6 +94,13 @@ func (f *queueFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(f.image)
 	case r.URL.Path == "/images/pageimage:p" && r.Method == "PUT":
+		f.imagePutAttempts++
+		if f.imagePutStatus != 0 {
+			status := f.imagePutStatus
+			f.imagePutStatus = 0
+			w.WriteHeader(status)
+			return
+		}
 		var image PageImage
 		_ = json.NewDecoder(r.Body).Decode(&image)
 		image.Rev = "1-image"
@@ -424,5 +433,63 @@ func TestLegacyFutureClockDoesNotBlockChangedCanonicalInk(t *testing.T) {
 				t.Fatalf("legacy future clock won over validated source: %+v", f.text)
 			}
 		})
+	}
+}
+
+func TestImageFailureAfterEraseRetriesAcrossRestartWithoutInference(t *testing.T) {
+	for _, status := range []int{503, 409} {
+		for _, eraseAll := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status=%d/blank=%v", status, eraseAll), func(t *testing.T) {
+				model := &stubModel{text: "original"}
+				f, w := setupQueue(t, model, -1)
+				w.cfg.ImagesDatabase = "images"
+				f.edit(func(p *Page) {
+					p.Strokes[0].ID = "erased"
+					remaining := p.Strokes[0]
+					remaining.ID = "remaining"
+					p.Strokes = append(p.Strokes, remaining)
+				})
+				pass(t, w)
+				initialCalls := model.count()
+				f.edit(func(p *Page) {
+					p.DeletedStrokes = append(p.DeletedStrokes, struct {
+						ID string `json:"id"`
+					}{ID: "erased"})
+					if eraseAll {
+						p.DeletedStrokes = append(p.DeletedStrokes, struct {
+							ID string `json:"id"`
+						}{ID: "remaining"})
+					}
+				})
+				f.mu.Lock()
+				f.imagePutStatus = status
+				f.mu.Unlock()
+				model.text = "remaining ink"
+				pass(t, w)
+				callsAfterErase := model.count()
+				if !eraseAll && callsAfterErase != initialCalls+1 {
+					t.Fatal("changed ink was not recognized")
+				}
+				if eraseAll && callsAfterErase != initialCalls {
+					t.Fatal("blank ink called the model")
+				}
+				state, _ := w.store.Load()
+				if f.text.SourceRev != "3-ink" || f.image.SourceRev != "2-ink" || state.Pending["page:p"].Attempts != 1 {
+					t.Fatal("failed image either lost successful text or pending retry")
+				}
+				// Nothing edits the page again. The saved transcript must turn this into an image-only retry.
+				restarted := New(w.couch, model, w.store, w.cfg, w.log)
+				restarted.now = w.now
+				advance(restarted, 10*time.Second)
+				pass(t, restarted)
+				state, _ = restarted.store.Load()
+				if f.image.SourceRev != "3-ink" || f.image.SourceFingerprint != f.text.SourceFingerprint || len(state.Pending) != 0 || model.count() != callsAfterErase || f.writes != 2 || f.imagePutAttempts != 3 {
+					t.Fatal("image retry lost work or repeated inference")
+				}
+				if eraseAll && (f.image.Width != 1 || f.image.Height != 1) {
+					t.Fatal("old ink survived blank-image retry")
+				}
+			})
+		}
 	}
 }
