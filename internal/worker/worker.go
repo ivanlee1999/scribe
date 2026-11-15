@@ -174,7 +174,11 @@ func (w *Worker) Once(ctx context.Context) (bool, error) {
 				backoff = 5 * time.Minute
 			}
 			job.DueAt = w.now().Add(backoff).UnixMilli()
-			w.log.Error("page deferred", "page", pageID, "attempt", job.Attempts, "error", err)
+			if errors.Is(err, errContextUnavailable) {
+				w.log.Debug("page context unavailable", "page", pageID, "attempt", job.Attempts)
+			} else {
+				w.log.Error("page deferred", "page", pageID, "attempt", job.Attempts, "error", err)
+			}
 		}
 		state.Pending[pageID] = job
 	} else {
@@ -187,6 +191,7 @@ func (w *Worker) Once(ctx context.Context) (bool, error) {
 }
 
 var errSourceChanged = errors.New("source changed during recognition")
+var errContextUnavailable = errors.New("page context unavailable")
 
 func (w *Worker) pipelineVersion() string {
 	identity := w.recognizer.Engine()
@@ -223,7 +228,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 		return err
 	}
 	if !live {
-		return nil
+		return errContextUnavailable
 	}
 	fingerprint := inkFingerprint(page)
 	pipeline := w.pipelineVersion()
@@ -475,7 +480,7 @@ func (w *Worker) validateSource(ctx context.Context, text PageText) error {
 		return err
 	}
 	if !live {
-		return errSourceChanged
+		return errContextUnavailable
 	}
 	if page.Rev != text.SourceRev || inkFingerprint(page) != text.SourceFingerprint || page.NotebookID != text.NotebookID {
 		return errSourceChanged

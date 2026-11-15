@@ -24,13 +24,18 @@ import (
 
 // Only protocol plumbing is faked; the source decode/render and durable state are real.
 type queueFixture struct {
-	mu      sync.Mutex
-	page    Page
-	text    *PageText
-	changes []string
-	writes  int
-	trashed bool
-	image   *PageImage
+	mu                sync.Mutex
+	page              Page
+	text              *PageText
+	changes           []string
+	writes            int
+	trashed           bool
+	image             *PageImage
+	missingNotebook   bool
+	missingMembership bool
+	parentFolderID    string
+	missingFolder     bool
+	folderTrashed     bool
 }
 
 func (f *queueFixture) edit(fn func(*Page)) {
@@ -57,11 +62,28 @@ func (f *queueFixture) serve(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/notes/page:p":
 		_ = json.NewEncoder(w).Encode(f.page)
 	case r.URL.Path == "/notes/notebook:b":
-		notebook := map[string]any{"pageIds": []string{"p"}}
+		if f.missingNotebook {
+			w.WriteHeader(404)
+			return
+		}
+		notebook := map[string]any{"pageIds": []string{"p"}, "parentFolderId": f.parentFolderID}
+		if f.missingMembership {
+			notebook["pageIds"] = []string{}
+		}
 		if f.trashed {
 			notebook["deletedAt"] = "2026-11-14T00:00:00Z"
 		}
 		_ = json.NewEncoder(w).Encode(notebook)
+	case r.URL.Path == "/notes/folder:f":
+		if f.missingFolder {
+			w.WriteHeader(404)
+			return
+		}
+		folder := map[string]any{}
+		if f.folderTrashed {
+			folder["deletedAt"] = "2026-11-14T00:00:00Z"
+		}
+		_ = json.NewEncoder(w).Encode(folder)
 	case r.URL.Path == "/images/pageimage:p" && r.Method == "GET":
 		if f.image == nil {
 			w.WriteHeader(404)
@@ -219,10 +241,17 @@ func TestTrashDuringInferenceDoesNotPublish(t *testing.T) {
 	if f.writes != 0 {
 		t.Fatal("published after trash")
 	}
-	pass(t, w)
 	state, _ := w.store.Load()
-	if len(state.Pending) != 0 {
-		t.Fatal("trashed page kept retrying")
+	if len(state.Pending) != 1 || state.Pending["page:p"].Attempts != 1 {
+		t.Fatal("trashed page lost its pending work")
+	}
+	f.mu.Lock()
+	f.trashed = false
+	f.mu.Unlock()
+	advance(w, 10*time.Second)
+	pass(t, w)
+	if f.text == nil || model.calls != 2 {
+		t.Fatal("restored page was not recognized without another edit")
 	}
 }
 func TestMalformedStrokeNeverReplacesPreviousText(t *testing.T) {
@@ -326,5 +355,45 @@ func TestErasingFinalStrokeReplacesRenderedImage(t *testing.T) {
 	}
 	if model.count() != 1 {
 		t.Fatal("paid model called for blank page")
+	}
+}
+
+func TestUnavailablePageContextRetriesWithoutInkEdit(t *testing.T) {
+	cases := []struct {
+		name        string
+		unavailable func(*queueFixture)
+		restore     func(*queueFixture)
+	}{
+		{"notebook arrives later", func(f *queueFixture) { f.missingNotebook = true }, func(f *queueFixture) { f.missingNotebook = false }},
+		{"membership arrives later", func(f *queueFixture) { f.missingMembership = true }, func(f *queueFixture) { f.missingMembership = false }},
+		{"parent folder arrives later", func(f *queueFixture) { f.parentFolderID = "f"; f.missingFolder = true }, func(f *queueFixture) { f.missingFolder = false }},
+		{"notebook restored", func(f *queueFixture) { f.trashed = true }, func(f *queueFixture) { f.trashed = false }},
+		{"parent folder restored", func(f *queueFixture) { f.parentFolderID = "f"; f.folderTrashed = true }, func(f *queueFixture) { f.folderTrashed = false }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &stubModel{text: "available again"}
+			f, w := setupQueue(t, model, -1)
+			f.mu.Lock()
+			tc.unavailable(f)
+			f.mu.Unlock()
+			pass(t, w)
+			state, _ := w.store.Load()
+			if model.count() != 0 || len(state.Pending) != 1 || state.Pending["page:p"].Attempts != 1 {
+				t.Fatal("unavailable context was processed or forgotten")
+			}
+			// Context updates have no page event. Durable retry must recover on its own.
+			f.mu.Lock()
+			tc.restore(f)
+			f.mu.Unlock()
+			restarted := New(w.couch, model, w.store, w.cfg, w.log)
+			restarted.now = w.now
+			advance(restarted, 10*time.Second)
+			pass(t, restarted)
+			state, _ = restarted.store.Load()
+			if model.count() != 1 || f.text == nil || len(state.Pending) != 0 {
+				t.Fatal("context recovery required another ink edit")
+			}
+		})
 	}
 }
