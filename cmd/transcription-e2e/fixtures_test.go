@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"testing"
 
 	"github.com/ivanlee1999/scribe/internal/sb"
@@ -101,5 +102,16 @@ func TestSeedRefusesAnExistingUnmarkedDatabase(t *testing.T) {
 	}
 	if err = driver.seed(context.Background(), fixtures()); err == nil || writes != 0 {
 		t.Fatal("seed wrote to an existing database")
+	}
+}
+
+func TestTranscriptChecksRejectExtraNumericContent(t *testing.T) {
+	for _, transcript := range []string{"milk2", "milk 2", "milk２", "milk ½"} {
+		if slices.Equal(words(transcript), []string{"milk"}) {
+			t.Fatalf("numeric content was discarded from %q", transcript)
+		}
+	}
+	if !slices.Equal(words("Milk."), []string{"milk"}) {
+		t.Fatal("ordinary capitalization and punctuation should remain acceptable")
 	}
 }

@@ -323,7 +323,7 @@ func (d *testDriver) apply(ctx context.Context, m manifest, p phase) error {
 	return d.put(ctx, d.db, current)
 }
 func words(text string) []string {
-	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) })
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) })
 }
 func (d *testDriver) verify(ctx context.Context, m manifest, p phase) (document, error) {
 	page, err := d.preserved(ctx, m)
