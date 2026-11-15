@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ivanlee1999/scribe/internal/config"
 	"github.com/ivanlee1999/scribe/internal/couch"
@@ -24,7 +25,7 @@ import (
 )
 
 func main() {
-	once := flag.Bool("once", false, "take one batch of changes and exit")
+	once := flag.Bool("once", false, "queue one batch, read at most one page, and exit")
 	check := flag.Bool("check", false, "verify the databases and the model, then exit")
 	flag.Parse()
 
@@ -75,6 +76,11 @@ func run(once, check bool) error {
 		return err
 	}
 
+	quiet := time.Duration(0)
+	// An explicit one-shot run processes one page without waiting for live ink.
+	if once {
+		quiet = -1
+	}
 	w := worker.New(client, model, worker.NewFileStore(cfg.StatePath), worker.Config{
 		NotesDatabase:  cfg.NotesDatabase,
 		TextDatabase:   cfg.TextDatabase,
@@ -82,6 +88,7 @@ func run(once, check bool) error {
 		DeviceID:       cfg.DeviceID,
 		Poll:           cfg.Poll,
 		Batch:          cfg.Batch,
+		Quiet:          quiet,
 	}, log)
 
 	if once {

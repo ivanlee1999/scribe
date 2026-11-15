@@ -2,6 +2,8 @@ package recognize
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"strings"
 	"unicode"
@@ -140,4 +142,18 @@ func hasRunawayRepetition(text string) bool {
 		}
 	}
 	return false
+}
+
+// PipelineVersion includes both configured readers and the escalation policy.
+func (c *Cascade) PipelineVersion() string {
+	identity := func(reader Recognizer) string {
+		if reader == nil {
+			return ""
+		}
+		if versioned, ok := reader.(interface{ PipelineVersion() string }); ok {
+			return versioned.PipelineVersion()
+		}
+		return reader.Engine()
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte("cascade-v1:"+identity(c.First)+":"+identity(c.Strong))))
 }

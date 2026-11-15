@@ -30,6 +30,7 @@ type queueFixture struct {
 	changes []string
 	writes  int
 	trashed bool
+	image   *PageImage
 }
 
 func (f *queueFixture) edit(fn func(*Page)) {
@@ -61,6 +62,18 @@ func (f *queueFixture) serve(w http.ResponseWriter, r *http.Request) {
 			notebook["deletedAt"] = "2026-11-14T00:00:00Z"
 		}
 		_ = json.NewEncoder(w).Encode(notebook)
+	case r.URL.Path == "/images/pageimage:p" && r.Method == "GET":
+		if f.image == nil {
+			w.WriteHeader(404)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(f.image)
+	case r.URL.Path == "/images/pageimage:p" && r.Method == "PUT":
+		var image PageImage
+		_ = json.NewDecoder(r.Body).Decode(&image)
+		image.Rev = "1-image"
+		f.image = &image
+		w.WriteHeader(201)
 	case r.URL.Path == "/text/pagetext:p" && r.Method == "GET":
 		if f.text == nil {
 			w.WriteHeader(404)
@@ -244,6 +257,7 @@ func TestPipelineUpgradeReplaysCheckpointedPagesExactlyOnce(t *testing.T) {
 	// Changing the recognizer identity also initiates one safe replay.
 	next := New(w.couch, &hookedModel{}, w.store, w.cfg, w.log)
 	next.now = w.now
+	next.cfg.Quiet = 0
 	pass(t, next)
 	if f.writes != 2 || f.text.Engine != "hook" {
 		t.Fatal("model change did not replay")
@@ -261,5 +275,56 @@ func TestCorruptStateReplaysRatherThanKeepingPartialCheckpoint(t *testing.T) {
 	state, err := NewFileStore(path).Load()
 	if err != nil || state.Seq != "0" || len(state.Pending) != 0 {
 		t.Fatalf("partial corrupt checkpoint survived: %+v %v", state, err)
+	}
+}
+
+func TestRemoveWinsTombstonesPreventErasedInkRecognition(t *testing.T) {
+	model := &stubModel{text: "original"}
+	f, w := setupQueue(t, model, -1)
+	f.edit(func(p *Page) { p.Strokes[0].ID = "erased" })
+	pass(t, w)
+	f.edit(func(p *Page) {
+		p.DeletedStrokes = append(p.DeletedStrokes, struct {
+			ID string `json:"id"`
+		}{ID: "erased"})
+		p.Strokes[0].PointsData = "malformed but deleted"
+	})
+	pass(t, w)
+	if model.count() != 1 || f.text.Text != "" || f.text.SourceRev != "3-ink" {
+		t.Fatalf("erased ink resurfaced: %+v", f.text)
+	}
+	// Tombstones for absent strokes do not alter the rendering input.
+	hash := f.text.SourceFingerprint
+	f.edit(func(p *Page) {
+		p.DeletedStrokes = append(p.DeletedStrokes, struct {
+			ID string `json:"id"`
+		}{ID: "already absent"})
+	})
+	pass(t, w)
+	if model.count() != 1 || f.text.SourceFingerprint != hash {
+		t.Fatal("irrelevant tombstone caused inference")
+	}
+}
+
+func TestErasingFinalStrokeReplacesRenderedImage(t *testing.T) {
+	model := &stubModel{text: "original"}
+	f, w := setupQueue(t, model, -1)
+	w.cfg.ImagesDatabase = "images"
+	f.edit(func(p *Page) { p.Strokes[0].ID = "erase-me" })
+	pass(t, w)
+	if f.image == nil || f.image.Width <= 1 || f.image.SourceRev != "2-ink" {
+		t.Fatal("rendered ink storage was lost")
+	}
+	f.edit(func(p *Page) {
+		p.DeletedStrokes = append(p.DeletedStrokes, struct {
+			ID string `json:"id"`
+		}{ID: "erase-me"})
+	})
+	pass(t, w)
+	if f.image == nil || f.image.Width != 1 || f.image.Height != 1 || f.image.SourceRev != "3-ink" || f.image.Attachments[ImageAttachmentName].Data == "" {
+		t.Fatal("erased ink image remained visible")
+	}
+	if model.count() != 1 {
+		t.Fatal("paid model called for blank page")
 	}
 }

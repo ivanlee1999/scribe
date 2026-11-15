@@ -46,13 +46,25 @@ The compose file runs a litellm sidecar as the `model` service, which presents t
 OpenAI-compatible endpoint scribe speaks and forwards to whatever `deploy/litellm.yaml` maps.
 Point `SCRIBE_MODEL_URL` elsewhere to use a different server; nothing in scribe changes either way.
 
-`-check` verifies both databases are reachable and exits. `-once` takes a single batch and
-exits, which is the way to watch a first run before letting it loose on the whole library —
-though note that a batch is `SCRIBE_BATCH` changes, 200 by default, so on a first run that is
-the whole library rather than a taste of it.
+`-check` verifies the databases are reachable and exits. `-once` durably queues one batch
+and reads at most one page, then exits. A full batch is queued before any inference; repeat
+`-once` or start the service to drain the backlog.
 
-The first run reads every page in the library. That is the backfill. Against a hosted model it
-is a couple of minutes; against a 3B model on a 6W CPU it is an overnight job.
+The service coalesces edits by page and waits five seconds after the latest observed change.
+Unfinished jobs and retries are saved with the CouchDB checkpoint, so provider outages and
+restarts do not require another pen stroke. There is one model job in flight. Ink changes during
+a request discard its result; metadata-only changes update transcript metadata without inference.
+
+A first run, checkpoint upgrade, or model/prompt/language change safely replays the feed.
+Unchanged source/pipeline hashes skip inference; legacy transcripts are reread once to establish
+source identity. This backfill can incur provider usage across the existing library. Use `-once`
+for a bounded trial before starting the continuous service.
+
+Recognized text remains separate from ink and typed blocks. New records additionally include
+`sourceRev` (the exact validated page revision), `sourceFingerprint` (server ink hash), and
+`pipelineVersion` (render/model/prompt/language identity). Readers should verify `sourceRev`
+against their canonical page and suppress remote text while local ink is unsynced. Legacy
+`recognizedClock` remains for older readers; device-local OCR hashes are not server ink hashes.
 
 ### Settings
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 type fake struct {
@@ -108,5 +109,21 @@ func TestCascadeDoesNotEscalateOnAFirstModelError(t *testing.T) {
 	}
 	if strong.runs != 0 {
 		t.Errorf("strong model ran %d times, want 0", strong.runs)
+	}
+}
+
+func TestCascadePipelineVersionTracksPromptAndStrongModel(t *testing.T) {
+	first := NewVisionModel("http://unused", "", "fast", "prompt A", "en", time.Second)
+	strong := NewVisionModel("http://unused", "", "strong", "prompt A", "en", time.Second)
+	cascade := &Cascade{First: first, Strong: strong}
+	before := cascade.PipelineVersion()
+	strong.Prompt = "prompt B"
+	if before == cascade.PipelineVersion() {
+		t.Fatal("strong prompt change did not invalidate pipeline")
+	}
+	before = cascade.PipelineVersion()
+	first.Language = "fr"
+	if before == cascade.PipelineVersion() {
+		t.Fatal("language change did not invalidate pipeline")
 	}
 }

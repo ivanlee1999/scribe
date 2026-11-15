@@ -272,8 +272,8 @@ func stripOnce(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// PipelineVersion changes when model, prompt or configured language changes.
+// PipelineVersion changes when endpoint, model, prompt or configured language changes.
 func (v *VisionModel) PipelineVersion() string {
-	data, _ := json.Marshal([]string{v.Model, v.Prompt, v.Language})
+	data, _ := json.Marshal([]string{v.BaseURL, v.Model, v.Prompt, v.Language})
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }

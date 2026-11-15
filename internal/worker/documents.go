@@ -4,30 +4,35 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
 // Page is the slice of a `page:` document this service reads.
 //
-// Everything else in a page document — images, tombstones, backgrounds, geometry — belongs to
-// the tablets' sync protocol and is none of this service's business. Decoding only what is
-// needed also means a protocol addition cannot break the server by surprise.
+// Only ink and its remove-wins tombstones participate in transcription. Typed blocks,
+// images and organizational metadata remain owned by the clients.
 type Page struct {
-	ID         string   `json:"_id"`
-	Rev        string   `json:"_rev"`
-	NotebookID string   `json:"notebookId"`
-	Title      string   `json:"title"`
-	UpdatedAt  string   `json:"updatedAt"`
-	PageWidth  float32  `json:"pageWidth"`
-	PageHeight float32  `json:"pageHeight"`
-	Strokes    []Stroke `json:"strokes"`
+	ID             string   `json:"_id"`
+	Rev            string   `json:"_rev"`
+	NotebookID     string   `json:"notebookId"`
+	Title          string   `json:"title"`
+	UpdatedAt      string   `json:"updatedAt"`
+	PageWidth      float32  `json:"pageWidth"`
+	PageHeight     float32  `json:"pageHeight"`
+	Strokes        []Stroke `json:"strokes"`
+	DeletedStrokes []struct {
+		ID string `json:"id"`
+	} `json:"deletedStrokes"`
 }
 
 // Stroke is one pen movement as the wire carries it.
 type Stroke struct {
-	Pen  string  `json:"pen"`
-	Size float32 `json:"size"`
+	ID        string  `json:"id,omitempty"`
+	CreatedAt string  `json:"createdAt,omitempty"`
+	Pen       string  `json:"pen"`
+	Size      float32 `json:"size"`
 	// PointsData is base64 of the SB binary; see the sb package.
 	PointsData string `json:"pointsData"`
 }
@@ -161,9 +166,11 @@ type PageImage struct {
 	Height int `json:"height"`
 	// RenderedClock is the page's own updatedAt at the moment the ink was drawn, exactly as
 	// RecognizedClock is for the text. It is what makes an image comparable against the page.
-	RenderedClock string `json:"renderedClock"`
-	UpdatedAt     string `json:"updatedAt"`
-	UpdatedBy     string `json:"updatedBy"`
+	RenderedClock     string `json:"renderedClock"`
+	SourceRev         string `json:"sourceRev,omitempty"`
+	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
+	UpdatedAt         string `json:"updatedAt"`
+	UpdatedBy         string `json:"updatedBy"`
 
 	Attachments map[string]Attachment `json:"_attachments,omitempty"`
 }
@@ -180,15 +187,38 @@ const ImageAttachmentName = "page.png"
 
 func pageImageID(pageID string) string { return "pageimage:" + pageID }
 
-// inkFingerprint excludes filing, title, clocks and typed blocks. Array order is rendering order.
+// inkFingerprint excludes filing, title, update clocks and typed blocks.
 func inkFingerprint(page Page) string {
 	source := struct {
 		Width, Height float32
 		Strokes       []Stroke
-	}{page.PageWidth, page.PageHeight, page.Strokes}
+	}{page.PageWidth, page.PageHeight, activeStrokes(page)}
 	if source.Strokes == nil {
 		source.Strokes = []Stroke{}
 	}
 	data, _ := json.Marshal(source)
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+}
+
+// Match the clients' remove-wins rule and canonical drawing order.
+func activeStrokes(page Page) []Stroke {
+	removed := map[string]bool{}
+	for _, tombstone := range page.DeletedStrokes {
+		if tombstone.ID != "" {
+			removed[tombstone.ID] = true
+		}
+	}
+	strokes := make([]Stroke, 0, len(page.Strokes))
+	for _, stroke := range page.Strokes {
+		if !removed[stroke.ID] {
+			strokes = append(strokes, stroke)
+		}
+	}
+	sort.SliceStable(strokes, func(i, j int) bool {
+		if strokes[i].CreatedAt != strokes[j].CreatedAt {
+			return strokes[i].CreatedAt < strokes[j].CreatedAt
+		}
+		return strokes[i].ID < strokes[j].ID
+	})
+	return strokes
 }

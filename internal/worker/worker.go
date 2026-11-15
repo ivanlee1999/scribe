@@ -2,11 +2,15 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	imagepkg "image"
+	"image/color"
+	"image/png"
 	"log/slog"
 	"time"
 
@@ -115,6 +119,9 @@ func (w *Worker) Once(ctx context.Context) (bool, error) {
 	state, err := w.store.Load()
 	if err != nil {
 		return false, fmt.Errorf("reading state: %w", err)
+	}
+	if state.Pending == nil {
+		state.Pending = map[string]Pending{}
 	}
 	if state.PipelineVersion != w.pipelineVersion() {
 		state.Seq = "0" // One idempotent backfill when configuration changes.
@@ -225,6 +232,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 		oldClock, oldOK := millis(existing.RecognizedClock)
 		pageClock, pageOK := millis(page.UpdatedAt)
 		if oldOK && pageOK && oldClock > pageClock {
+			w.backfillImage(ctx, page, pageID)
 			return nil
 		}
 	}
@@ -282,7 +290,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 func (w *Worker) decode(page Page) ([]render.Stroke, error) {
 	strokes := make([]render.Stroke, 0, len(page.Strokes))
 	total := 0
-	for i, stroke := range page.Strokes {
+	for i, stroke := range activeStrokes(page) {
 		total += len(stroke.PointsData)
 		if total > w.cfg.MaxPageBytes {
 			return nil, fmt.Errorf("page stroke payload exceeds %d bytes", w.cfg.MaxPageBytes)
@@ -338,7 +346,7 @@ func (w *Worker) backfillImage(ctx context.Context, page Page, pageID string) {
 	var existing PageImage
 	err := w.couch.Get(ctx, w.cfg.ImagesDatabase, pageImageID(pageID), &existing)
 	switch {
-	case err == nil && !stale(page.UpdatedAt, existing.RenderedClock):
+	case err == nil && existing.SourceFingerprint == inkFingerprint(page):
 		return
 	case err != nil && !errors.Is(err, couch.ErrNotFound):
 		w.log.Warn("could not read the existing image", "page", page.ID, "error", err)
@@ -365,10 +373,19 @@ func (w *Worker) backfillImage(ctx context.Context, page Page, pageID string) {
 // fails here is re-rendered the next time its ink changes, which is the only time the image is
 // out of date anyway.
 func (w *Worker) publishImage(ctx context.Context, image render.Result, page Page, pageID, clock string) {
-	if w.cfg.ImagesDatabase == "" || image.Empty {
+	if w.cfg.ImagesDatabase == "" {
 		return
 	}
-
+	// Replace an old image after the final stroke is erased, rather than leaving erased ink visible.
+	if image.Empty {
+		blank := imagepkg.NewRGBA(imagepkg.Rect(0, 0, 1, 1))
+		blank.Set(0, 0, color.White)
+		var encoded bytes.Buffer
+		if err := png.Encode(&encoded, blank); err != nil {
+			return
+		}
+		image = render.Result{PNG: encoded.Bytes(), Width: 1, Height: 1}
+	}
 	id := pageImageID(pageID)
 	var existing PageImage
 	if err := w.couch.Get(ctx, w.cfg.ImagesDatabase, id, &existing); err != nil && !errors.Is(err, couch.ErrNotFound) {
@@ -384,8 +401,9 @@ func (w *Worker) publishImage(ctx context.Context, image render.Result, page Pag
 		Width:         image.Width,
 		Height:        image.Height,
 		RenderedClock: clock,
-		UpdatedAt:     nowStamp(),
-		UpdatedBy:     w.cfg.DeviceID,
+		SourceRev:     page.Rev, SourceFingerprint: inkFingerprint(page),
+		UpdatedAt: nowStamp(),
+		UpdatedBy: w.cfg.DeviceID,
 		Attachments: map[string]Attachment{
 			ImageAttachmentName: {ContentType: "image/png", Data: base64.StdEncoding.EncodeToString(image.PNG)},
 		},
@@ -410,14 +428,21 @@ func (w *Worker) publish(ctx context.Context, text PageText) error {
 		return fmt.Errorf("publishing %s: status %d", text.ID, status)
 	}
 
-	// A tablet wrote between the read and the write. Re-read and re-apply the guard rather than
-	// forcing this copy through: if their text describes newer ink, this server stands down.
+	// Another writer won the revision. Validate the canonical source again before retrying.
+	// Readers reject records whose sourceRev no longer matches their page snapshot.
 	var current PageText
 	if err := w.couch.Get(ctx, w.cfg.TextDatabase, text.ID, &current); err != nil {
 		return err
 	}
 	if current.SourceRev == text.SourceRev && current.SourceFingerprint == text.SourceFingerprint && current.PipelineVersion == text.PipelineVersion && current.Text == text.Text && current.PageTitle == text.PageTitle {
 		return nil
+	}
+	if current.SourceFingerprint == "" {
+		remoteClock, remoteOK := millis(current.RecognizedClock)
+		candidateClock, candidateOK := millis(text.RecognizedClock)
+		if remoteOK && candidateOK && remoteClock > candidateClock {
+			return nil
+		}
 	}
 	if text.SourceFingerprint == "" && !supersedes(text, current) {
 		return nil
