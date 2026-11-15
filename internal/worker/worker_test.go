@@ -257,9 +257,9 @@ func TestEditingAPageMakesItReadableAgain(t *testing.T) {
 	}
 }
 
-func TestATabletsReadingOfNewerInkIsLeftAlone(t *testing.T) {
-	// The rule that keeps three writers from fighting. The tablet has read ink this server has
-	// not seen; publishing over it would lose the better answer and invite a rewrite back.
+func TestLegacyFutureClockCannotBlockCanonicalSource(t *testing.T) {
+	// A legacy timestamp cannot prove which ink it describes. The canonical page revision and
+	// fingerprint determine freshness, including when a device clock has moved backward.
 	l := requireCouch(t)
 	l.putPage(t, "page-1", "2026-08-18T04:00:00.000Z", 1)
 	l.upsert(t, l.text, "pagetext:page-1", map[string]any{
@@ -277,8 +277,8 @@ func TestATabletsReadingOfNewerInkIsLeftAlone(t *testing.T) {
 	}
 
 	text, _ := l.readText(t, "page-1")
-	if text.Text != "from the iPad" {
-		t.Errorf("text = %q — the server overwrote a reading of newer ink", text.Text)
+	if text.Text != "from the server" || text.SourceRev == "" || text.SourceFingerprint == "" {
+		t.Errorf("legacy clock blocked canonical source: %+v", text)
 	}
 }
 

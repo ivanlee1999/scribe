@@ -232,15 +232,6 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 	}
 	fingerprint := inkFingerprint(page)
 	pipeline := w.pipelineVersion()
-	// Retain legacy text claiming genuinely newer ink; exact-clock legacy records are upgraded.
-	if haveExisting && existing.SourceFingerprint == "" {
-		oldClock, oldOK := millis(existing.RecognizedClock)
-		pageClock, pageOK := millis(page.UpdatedAt)
-		if oldOK && pageOK && oldClock > pageClock {
-			w.backfillImage(ctx, page, pageID)
-			return nil
-		}
-	}
 	var result recognize.Result
 	var image render.Result
 	if haveExisting && existing.SourceFingerprint == fingerprint && existing.PipelineVersion == pipeline {
@@ -441,13 +432,6 @@ func (w *Worker) publish(ctx context.Context, text PageText) error {
 	}
 	if current.SourceRev == text.SourceRev && current.SourceFingerprint == text.SourceFingerprint && current.PipelineVersion == text.PipelineVersion && current.Text == text.Text && current.PageTitle == text.PageTitle {
 		return nil
-	}
-	if current.SourceFingerprint == "" {
-		remoteClock, remoteOK := millis(current.RecognizedClock)
-		candidateClock, candidateOK := millis(text.RecognizedClock)
-		if remoteOK && candidateOK && remoteClock > candidateClock {
-			return nil
-		}
 	}
 	if text.SourceFingerprint == "" && !supersedes(text, current) {
 		return nil

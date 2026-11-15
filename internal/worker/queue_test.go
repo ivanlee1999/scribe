@@ -24,6 +24,7 @@ import (
 
 // Only protocol plumbing is faked; the source decode/render and durable state are real.
 type queueFixture struct {
+	conflictText      *PageText
 	mu                sync.Mutex
 	page              Page
 	text              *PageText
@@ -103,6 +104,12 @@ func (f *queueFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(f.text)
 	case r.URL.Path == "/text/pagetext:p" && r.Method == "PUT":
+		if f.conflictText != nil {
+			f.text = f.conflictText
+			f.conflictText = nil
+			w.WriteHeader(409)
+			return
+		}
 		var text PageText
 		_ = json.NewDecoder(r.Body).Decode(&text)
 		if f.text != nil && text.Rev != f.text.Rev {
@@ -393,6 +400,28 @@ func TestUnavailablePageContextRetriesWithoutInkEdit(t *testing.T) {
 			state, _ = restarted.store.Load()
 			if model.count() != 1 || f.text == nil || len(state.Pending) != 0 {
 				t.Fatal("context recovery required another ink edit")
+			}
+		})
+	}
+}
+
+func TestLegacyFutureClockDoesNotBlockChangedCanonicalInk(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("conflict=%v", conflict), func(t *testing.T) {
+			model := &stubModel{text: "canonical ink"}
+			f, w := setupQueue(t, model, -1)
+			legacy := &PageText{ID: "pagetext:p", Rev: "1-legacy", PageID: "p", Text: "old legacy ink", Engine: "vision", RecognizedClock: "2099-01-01T00:00:00Z", UpdatedAt: "2099-01-01T00:00:00Z"}
+			f.mu.Lock()
+			if conflict {
+				f.conflictText = legacy
+			} else {
+				f.text = legacy
+			}
+			f.mu.Unlock()
+			f.edit(func(p *Page) { p.Strokes = append(p.Strokes, p.Strokes[0]); p.UpdatedAt = "2020-01-01T00:00:00Z" })
+			pass(t, w)
+			if model.count() != 1 || f.text.Text != "canonical ink" || f.text.SourceRev != "2-ink" || f.text.RecognizedClock != "2020-01-01T00:00:00Z" || f.text.SourceFingerprint == "" {
+				t.Fatalf("legacy future clock won over validated source: %+v", f.text)
 			}
 		})
 	}
