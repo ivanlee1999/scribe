@@ -42,6 +42,7 @@ type Recognizer interface {
 
 const FormatMarkdown = "markdown"
 const PromptVersion = "layout-gfm-v1"
+const cleanupVersion = "outer-fence-v2"
 
 // DefaultPrompt asks for a transcription and nothing else.
 //
@@ -251,9 +252,10 @@ var absenceClaim = regexp.MustCompile(strings.Join([]string{
 func stripOnce(text string) string {
 	text = strings.TrimSpace(text)
 
-	// A fenced block, with or without a language tag on the opening fence.
+	// Strip a single complete outer wrapper. Source code blocks followed by more content
+	// (or by another code block) must keep their fences and all following text.
 	if strings.HasPrefix(text, "```") {
-		if end := strings.LastIndex(text, "```"); end > 3 {
+		if end := strings.LastIndex(text, "```"); end > 3 && end+3 == len(text) && !strings.Contains(text[3:end], "```") {
 			inner := text[3:end]
 			if newline := strings.IndexByte(inner, '\n'); newline >= 0 {
 				first := strings.TrimSpace(inner[:newline])
@@ -286,8 +288,8 @@ func stripOnce(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// PipelineVersion also changes when the derived output format or layout contract changes.
+// PipelineVersion also changes when the derived format, layout or cleanup contract changes.
 func (v *VisionModel) PipelineVersion() string {
-	data, _ := json.Marshal([]string{v.BaseURL, v.Model, v.Prompt, v.Language, v.Format(), PromptVersion})
+	data, _ := json.Marshal([]string{v.BaseURL, v.Model, v.Prompt, v.Language, v.Format(), PromptVersion, cleanupVersion})
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }

@@ -279,3 +279,22 @@ func TestLayoutPipelineDiffersFromLegacyIdentity(t *testing.T) {
 		t.Fatal("format/prompt contract omitted from pipeline identity")
 	}
 }
+
+func TestCleanPreservesSourceCodeBlocksAndFollowingContent(t *testing.T) {
+	for _, source := range []string{
+		"```swift\nlet total = 2\n```\n\n# Next\n- [ ] Review\n\nKeep this paragraph.",
+		"```text\nliteral text\n```\n\n1. Keep this\n    - And this",
+		"```text\nfirst block\n```\n\n## Another heading\n\n```swift\nlast block\n```",
+	} {
+		if got := Clean(source); got != source {
+			t.Fatalf("source fences or following content lost:\n%s\nwant:\n%s", got, source)
+		}
+		if got := Clean("Here is the transcription:\n" + source); got != source {
+			t.Fatalf("preamble cleanup lost source content:\n%s", got)
+		}
+	}
+	wrapped := "\n```markdown\n" + structuredTranscript + "\n``` \n"
+	if got := Clean(wrapped); got != structuredTranscript {
+		t.Fatal("a complete outer wrapper was not stripped")
+	}
+}
