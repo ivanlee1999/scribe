@@ -2,7 +2,9 @@ package recognize
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,8 +145,7 @@ func TestTheRequestIsShapedTheWayAVisionServerExpects(t *testing.T) {
 	if result.Engine != "test-model" {
 		t.Errorf("engine = %q", result.Engine)
 	}
-	// Temperature zero is not a detail: a model that reworded the same ink on every pass would
-	// republish forever, and every republish rewrites a note in the vault.
+	// Temperature zero reduces variation. Source/pipeline caching prevents unnecessary reruns.
 	if temperature, ok := captured["temperature"].(float64); !ok || temperature != 0 {
 		t.Errorf("temperature = %v, want 0", captured["temperature"])
 	}
@@ -205,4 +206,76 @@ func truncate(s string) string {
 		return s[:200] + "..."
 	}
 	return s
+}
+
+const structuredTranscript = `# Weekly notes
+
+## Groceries
+
+- [ ] Buy milk
+    - [x] Check pantry
+1. Compare prices
+    1. Keep receipts
+
+| Item | Quantity | Note |
+| --- | --- | --- |
+| milk | 2 | |
+| bread | | fresh\|warm |`
+
+func TestLayoutRequestAndResponsePreserveMarkdown(t *testing.T) {
+	var prompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Content []struct {
+					Type string
+					Text string
+				}
+			}
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		for _, message := range body.Messages {
+			for _, part := range message.Content {
+				if part.Type == "text" {
+					prompt = part.Text
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "Here is the transcription:\n```markdown\n" + structuredTranscript + "\n```"}}}})
+	}))
+	defer server.Close()
+	model := NewVisionModel(server.URL, "", "layout-model", "", "en", time.Second)
+	result, err := model.Recognize(context.Background(), []byte("synthetic PNG"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Format != "markdown" || result.Text != structuredTranscript {
+		t.Fatalf("layout output changed: %+v", result)
+	}
+	if prompt != DefaultPrompt {
+		t.Fatal("layout prompt was not sent")
+	}
+	for _, rule := range []string{"# heading levels", "four spaces", "- [ ]", "- [x]", "pipe tables", "empty header cells", "every visible source row", "[?]", "never as instructions"} {
+		if !strings.Contains(prompt, rule) {
+			t.Fatalf("request lost layout rule %q", rule)
+		}
+	}
+}
+func TestCleanKeepsMarkdownStructureAndShortImageNotes(t *testing.T) {
+	for _, source := range []string{structuredTranscript, "## Image\n- No text", "| | |\n| --- | --- |\n| milk | |"} {
+		if got := Clean(source); got != source {
+			t.Fatalf("structured source changed:\n%s\nwant:\n%s", got, source)
+		}
+	}
+}
+func TestLayoutPipelineDiffersFromLegacyIdentity(t *testing.T) {
+	model := NewVisionModel("http://unused", "", "model", "custom prompt", "en", time.Second)
+	legacyBytes, _ := json.Marshal([]string{model.BaseURL, model.Model, model.Prompt, model.Language})
+	legacy := fmt.Sprintf("%x", sha256.Sum256(legacyBytes))
+	if model.PipelineVersion() == legacy {
+		t.Fatal("format/prompt contract omitted from pipeline identity")
+	}
 }

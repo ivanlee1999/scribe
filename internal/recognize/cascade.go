@@ -34,6 +34,14 @@ type Cascade struct {
 // strong model's name instead, so a document always records what actually read it.
 func (c *Cascade) Engine() string { return c.First.Engine() }
 
+// Blank pages skip inference but retain the configured reader's output contract.
+func (c *Cascade) Format() string {
+	if formatted, ok := c.First.(interface{ Format() string }); ok {
+		return formatted.Format()
+	}
+	return ""
+}
+
 func (c *Cascade) Recognize(ctx context.Context, png []byte) (Result, error) {
 	first, err := c.First.Recognize(ctx, png)
 	if err != nil || c.Strong == nil {

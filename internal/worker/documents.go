@@ -46,6 +46,7 @@ type PageText struct {
 	NotebookID        string `json:"notebookId,omitempty"`
 	PageTitle         string `json:"pageTitle,omitempty"`
 	Text              string `json:"text"`
+	Format            string `json:"format,omitempty"`
 	SourceRev         string `json:"sourceRev,omitempty"`
 	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
 	PipelineVersion   string `json:"pipelineVersion,omitempty"`
@@ -134,7 +135,7 @@ func supersedes(local, remote PageText) bool {
 		return localInk > remoteInk
 	}
 
-	if local.Text == remote.Text && local.Engine == remote.Engine && local.Language == remote.Language {
+	if local.Text == remote.Text && local.Format == remote.Format && local.Engine == remote.Engine && local.Language == remote.Language {
 		return false
 	}
 

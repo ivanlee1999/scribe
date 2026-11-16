@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 
 // Only protocol plumbing is faked; the source decode/render and durable state are real.
 type queueFixture struct {
+	sourceWrites      int
 	imagePutStatus    int
 	imagePutAttempts  int
 	conflictText      *PageText
@@ -52,6 +54,11 @@ func (f *queueFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "GET" && strings.HasPrefix(r.URL.Path, "/notes") {
+		f.sourceWrites++
+		w.WriteHeader(403)
+		return
+	}
 	switch {
 	case r.URL.Path == "/notes/_changes":
 		since, _ := strconv.Atoi(r.URL.Query().Get("since"))
@@ -491,5 +498,55 @@ func TestImageFailureAfterEraseRetriesAcrossRestartWithoutInference(t *testing.T
 				}
 			})
 		}
+	}
+}
+
+func TestMarkdownTranscriptRebindsMetadataAndEmptyInkWithoutSourceWrites(t *testing.T) {
+	markdown := "# Groceries\n\n- [ ] milk\n    - [x] pantry\n\n| Item | Qty |\n| --- | --- |\n| milk | |"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": markdown}}}})
+	}))
+	defer server.Close()
+	model := &recognize.Cascade{First: recognize.NewVisionModel(server.URL, "", "layout-model", "", "en", time.Second)}
+	f, w := setupQueue(t, model, -1)
+	before, _ := json.Marshal(f.page)
+	pass(t, w)
+	after, _ := json.Marshal(f.page)
+	if string(before) != string(after) || f.sourceWrites != 0 || f.text.Format != "markdown" || f.text.Text != markdown {
+		t.Fatal("derived recognition changed source or lost format/content")
+	}
+	fingerprint := f.text.SourceFingerprint
+	f.edit(func(p *Page) { p.Title = "Renamed"; p.UpdatedAt = "2026-11-14T01:00:00Z" })
+	before, _ = json.Marshal(f.page)
+	pass(t, w)
+	after, _ = json.Marshal(f.page)
+	if calls.Load() != 1 || f.text.Format != "markdown" || f.text.Text != markdown || f.text.SourceFingerprint != fingerprint || f.text.SourceRev != "2-ink" || string(before) != string(after) || f.sourceWrites != 0 {
+		t.Fatal("metadata rebind lost format or reran recognition/mutated source")
+	}
+	f.edit(func(p *Page) { p.Strokes = nil })
+	pass(t, w)
+	if calls.Load() != 1 || f.text.Text != "" || f.text.Format != "markdown" || f.sourceWrites != 0 {
+		t.Fatal("blank derived reading lost format or changed source")
+	}
+}
+func TestMetadataRebindPreservesLegacyAndUnknownFormat(t *testing.T) {
+	for _, format := range []string{"", "future-format"} {
+		t.Run(format, func(t *testing.T) {
+			model := &stubModel{text: "must not run"}
+			f, w := setupQueue(t, model, -1)
+			f.text = &PageText{ID: "pagetext:p", Rev: "1-text", PageID: "p", Text: "literal # text", Format: format, Engine: model.Engine(), SourceRev: f.page.Rev, SourceFingerprint: inkFingerprint(f.page), PipelineVersion: w.pipelineVersion()}
+			f.edit(func(p *Page) { p.Title = "Renamed" })
+			pass(t, w)
+			if model.count() != 0 || f.text.Format != format || f.text.Text != "literal # text" || f.sourceWrites != 0 {
+				t.Fatal("metadata rebind reinterpreted legacy format")
+			}
+			wire, _ := json.Marshal(f.text)
+			if format == "" && strings.Contains(string(wire), `"format"`) {
+				t.Fatal("legacy absent format became an explicit markdown record")
+			}
+		})
 	}
 }

@@ -238,7 +238,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 		if existing.SourceRev == page.Rev && existing.PageTitle == page.Title && existing.NotebookID == page.NotebookID {
 			return w.backfillImage(ctx, page, pageID)
 		}
-		result = recognize.Result{Text: existing.Text, Engine: existing.Engine, Language: existing.Language}
+		result = recognize.Result{Text: existing.Text, Engine: existing.Engine, Language: existing.Language, Format: existing.Format}
 	} else {
 		strokes, err := w.decode(page)
 		if err != nil {
@@ -265,7 +265,7 @@ func (w *Worker) handlePage(ctx context.Context, documentID string) error {
 	}
 	text := PageText{
 		ID: textID, Rev: existing.Rev, PageID: pageID, NotebookID: latest.NotebookID,
-		PageTitle: latest.Title, Text: result.Text, Engine: result.Engine, Language: result.Language,
+		PageTitle: latest.Title, Text: result.Text, Format: result.Format, Engine: result.Engine, Language: result.Language,
 		RecognizedClock: latest.UpdatedAt, UpdatedAt: nowStamp(), UpdatedBy: w.cfg.DeviceID,
 		SourceRev: latest.Rev, SourceFingerprint: fingerprint, PipelineVersion: pipeline,
 	}
@@ -318,7 +318,11 @@ func (w *Worker) read(ctx context.Context, image render.Result, page Page) (reco
 	if image.Empty {
 		// Recorded as recognized-and-empty rather than skipped, so the page stops being
 		// revisited on every pass and readers can tell "blank" from "not looked at yet".
-		return recognize.Result{Text: "", Engine: w.recognizer.Engine()}, nil
+		result := recognize.Result{Text: "", Engine: w.recognizer.Engine()}
+		if formatted, ok := w.recognizer.(interface{ Format() string }); ok {
+			result.Format = formatted.Format()
+		}
+		return result, nil
 	}
 
 	started := time.Now()
@@ -419,7 +423,7 @@ func (w *Worker) publish(ctx context.Context, text PageText) error {
 	if err := w.couch.Get(ctx, w.cfg.TextDatabase, text.ID, &current); err != nil {
 		return err
 	}
-	if current.SourceRev == text.SourceRev && current.SourceFingerprint == text.SourceFingerprint && current.PipelineVersion == text.PipelineVersion && current.Text == text.Text && current.PageTitle == text.PageTitle {
+	if current.SourceRev == text.SourceRev && current.SourceFingerprint == text.SourceFingerprint && current.PipelineVersion == text.PipelineVersion && current.Text == text.Text && current.Format == text.Format && current.PageTitle == text.PageTitle {
 		return nil
 	}
 	if text.SourceFingerprint == "" && !supersedes(text, current) {
