@@ -28,12 +28,14 @@ const createdAt = "2026-11-14T12:00:00.000Z"
 type document = map[string]any
 
 type phase struct {
-	Name           string   `json:"name"`
-	ExpectedWords  []string `json:"expectedWords"`
-	ForbiddenWords []string `json:"forbiddenWords"`
-	Page           document `json:"page"`
+	Layout         *layoutExpectation `json:"layout,omitempty"`
+	Name           string             `json:"name"`
+	ExpectedWords  []string           `json:"expectedWords"`
+	ForbiddenWords []string           `json:"forbiddenWords"`
+	Page           document           `json:"page"`
 }
 type manifest struct {
+	RequiredFormat      string   `json:"requiredFormat,omitempty"`
 	SupersededStrokeIDs []string `json:"supersededStrokeIds"`
 	Version             int      `json:"version"`
 	NotebookID          string   `json:"notebookId"`
@@ -214,16 +216,23 @@ func writeFixtures(dir string, m manifest) error {
 		if err = os.WriteFile(filepath.Join(dir, phase.Name+".json"), append(pageJSON, '\n'), 0644); err != nil {
 			return err
 		}
+		source, decodeErr := decodedPage(phase.Page)
+		if decodeErr != nil {
+			return decodeErr
+		}
 		var strokes []render.Stroke
-		for _, stroke := range phase.Page["strokes"].([]document) {
-			raw, _ := base64.StdEncoding.DecodeString(stroke["pointsData"].(string))
+		for _, stroke := range visibleStrokes(source) {
+			raw, decodeErr := base64.StdEncoding.DecodeString(stroke.PointsData)
+			if decodeErr != nil {
+				return decodeErr
+			}
 			points, decodeErr := sb.Decode(raw)
 			if decodeErr != nil {
 				return decodeErr
 			}
-			strokes = append(strokes, render.Stroke{Points: points, Size: 5, Pen: "BALLPEN"})
+			strokes = append(strokes, render.Stroke{Points: points, Size: stroke.Size, Pen: stroke.Pen})
 		}
-		image, renderErr := render.Render(strokes, render.DefaultOptions(1080, 720))
+		image, renderErr := render.Render(strokes, render.DefaultOptions(source.PageWidth, source.PageHeight))
 		if renderErr != nil {
 			return renderErr
 		}

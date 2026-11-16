@@ -97,12 +97,12 @@ func (d *testDriver) put(ctx context.Context, database string, doc document) err
 	_, _, err := d.request(ctx, "PUT", database, doc["_id"].(string), doc)
 	return err
 }
-func (d *testDriver) guard(ctx context.Context) error {
+func (d *testDriver) guard(ctx context.Context, generation string) error {
 	meta, err := d.get(ctx, d.db, "sync-meta:database")
 	if err != nil {
 		return err
 	}
-	if meta["generation"] != generationID || meta["type"] != "sync-database-metadata" || meta["locked"] != false {
+	if meta["generation"] != generation || meta["type"] != "sync-database-metadata" || meta["locked"] != false {
 		return errors.New("test database generation marker does not match; refusing access")
 	}
 	return nil
@@ -121,7 +121,7 @@ func (d *testDriver) seed(ctx context.Context, m manifest) error {
 	if err := d.put(ctx, d.db, m.Metadata); err != nil {
 		return err
 	}
-	if err := d.guard(ctx); err != nil {
+	if err := d.guard(ctx, m.Metadata["generation"].(string)); err != nil {
 		return err
 	}
 	for _, item := range []struct {
@@ -134,7 +134,7 @@ func (d *testDriver) seed(ctx context.Context, m manifest) error {
 	}
 	return nil
 }
-func typedText(page document) (string, error) {
+func typedText(page document, blockID string) (string, error) {
 	blocks, ok := page["blocks"].([]any)
 	if !ok {
 		return "", errors.New("typed blocks missing")
@@ -154,35 +154,35 @@ func typedText(page document) (string, error) {
 	return "", errors.New("typed paragraph missing")
 }
 func (d *testDriver) preserved(ctx context.Context, m manifest) (document, error) {
-	if err := d.guard(ctx); err != nil {
+	if err := d.guard(ctx, m.Metadata["generation"].(string)); err != nil {
 		return nil, err
 	}
-	notebook, err := d.get(ctx, d.db, "notebook:"+notebookID)
+	notebook, err := d.get(ctx, d.db, "notebook:"+m.NotebookID)
 	if err != nil {
 		return nil, err
 	}
 	ids, _ := notebook["pageIds"].([]any)
 	found := false
 	for _, id := range ids {
-		if id == pageID {
+		if id == m.PageID {
 			found = true
 		}
 	}
 	if !found || notebook["_deleted"] == true || notebook["deletedAt"] != nil {
 		return nil, errors.New("fixture notebook membership/visibility changed")
 	}
-	page, err := d.get(ctx, d.db, "page:"+pageID)
+	page, err := d.get(ctx, d.db, "page:"+m.PageID)
 	if err != nil {
 		return nil, err
 	}
-	text, err := typedText(page)
+	text, err := typedText(page, m.BlockID)
 	if err != nil {
 		return nil, err
 	}
-	if text != typedParagraph {
+	if text != m.TypedParagraph {
 		return nil, errors.New("typed paragraph changed")
 	}
-	organization, err := d.get(ctx, d.db+"_organization", "journal:"+notebookID)
+	organization, err := d.get(ctx, d.db+"_organization", "journal:"+m.NotebookID)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +241,7 @@ func matchesInk(actual document, p phase) error {
 	if err != nil {
 		return err
 	}
-	if current.NotebookID != notebookID || current.PageWidth != 1080 || current.PageHeight != 720 {
+	if current.NotebookID != expected.NotebookID || current.PageWidth != expected.PageWidth || current.PageHeight != expected.PageHeight {
 		return errors.New("page identity/dimensions changed")
 	}
 	a, b := visibleStrokes(current), visibleStrokes(expected)
@@ -319,7 +319,7 @@ func (d *testDriver) apply(ctx context.Context, m manifest, p phase) error {
 	}
 	current["deletedStrokes"] = merged
 	current["updatedAt"] = p.Page["updatedAt"]
-	current["updatedBy"] = writerID
+	current["updatedBy"] = p.Page["updatedBy"]
 	return d.put(ctx, d.db, current)
 }
 func words(text string) []string {
@@ -337,7 +337,7 @@ func (d *testDriver) verify(ctx context.Context, m manifest, p phase) (document,
 	if err != nil {
 		return nil, err
 	}
-	text, err := d.get(ctx, d.db+"_text", "pagetext:"+pageID)
+	text, err := d.get(ctx, d.db+"_text", "pagetext:"+m.PageID)
 	if err != nil {
 		return nil, err
 	}
@@ -349,10 +349,21 @@ func (d *testDriver) verify(ctx context.Context, m manifest, p phase) (document,
 		return nil, errors.New("transcript pipeline version missing")
 	}
 	recognized, _ := text["text"].(string)
-	if !slices.Equal(words(recognized), p.ExpectedWords) {
+	if m.RequiredFormat != "" && text["format"] != m.RequiredFormat {
+		return nil, errors.New("required transcript format missing")
+	}
+	if p.Layout != nil {
+		if err := checkLayout(recognized, p); err != nil {
+			return nil, err
+		}
+	} else if !slices.Equal(words(recognized), p.ExpectedWords) {
 		return nil, fmt.Errorf("actual provider transcript mismatch: got %q, want words %v", recognized, p.ExpectedWords)
 	}
-	report := document{"phase": p.Name, "pageTitle": page["title"], "sourceRev": page["_rev"], "sourceFingerprint": text["sourceFingerprint"], "pipelineVersion": pipeline, "engine": text["engine"], "text": recognized, "journalDate": m.JournalDate, "activeTopics": m.ActiveTopics, "removedTopic": m.RemovedTopic, "typedParagraph": typedParagraph, "verifiedAt": time.Now().UTC().Format(time.RFC3339Nano)}
+	hashes, err := d.sourceHashes(ctx, m, page)
+	if err != nil {
+		return nil, err
+	}
+	report := document{"canonicalHashes": hashes, "phase": p.Name, "notebookId": m.NotebookID, "pageId": m.PageID, "pageTitle": page["title"], "sourceRev": page["_rev"], "sourceFingerprint": text["sourceFingerprint"], "pipelineVersion": pipeline, "engine": text["engine"], "format": text["format"], "text": recognized, "journalDate": m.JournalDate, "activeTopics": m.ActiveTopics, "removedTopic": m.RemovedTopic, "typedParagraph": m.TypedParagraph, "verifiedAt": time.Now().UTC().Format(time.RFC3339Nano)}
 	return report, nil
 }
 func (d *testDriver) wait(ctx context.Context, m manifest, p phase) (document, error) {
@@ -370,7 +381,7 @@ func (d *testDriver) wait(ctx context.Context, m manifest, p phase) (document, e
 		}
 	}
 }
-func saveReport(dir string, p phase, report document) error {
+func saveReport(dir string, p phase, report document, kind string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -378,7 +389,7 @@ func saveReport(dir string, p phase, report document) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, p.Name+"-verified.json"), append(data, '\n'), 0644)
+	return os.WriteFile(filepath.Join(dir, p.Name+"-"+kind+".json"), append(data, '\n'), 0644)
 }
 
 // metadata changes only page filing text; it exercises the no-inference update path.
@@ -392,6 +403,42 @@ func (d *testDriver) metadata(ctx context.Context, m manifest, p phase) error {
 	}
 	current["title"] = "Synthetic groceries — renamed"
 	current["updatedAt"] = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	current["updatedBy"] = writerID
+	current["updatedBy"] = p.Page["updatedBy"]
 	return d.put(ctx, d.db, current)
+}
+
+func canonicalHash(doc document) string {
+	clean := document{}
+	for key, value := range doc {
+		if key != "_rev" {
+			clean[key] = value
+		}
+	}
+	data, _ := json.Marshal(clean)
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+}
+func (d *testDriver) sourceHashes(ctx context.Context, m manifest, page document) (document, error) {
+	notebook, err := d.get(ctx, d.db, "notebook:"+m.NotebookID)
+	if err != nil {
+		return nil, err
+	}
+	organization, err := d.get(ctx, d.db+"_organization", "journal:"+m.NotebookID)
+	if err != nil {
+		return nil, err
+	}
+	return document{"page": canonicalHash(page), "notebook": canonicalHash(notebook), "organization": canonicalHash(organization)}, nil
+}
+func (d *testDriver) snapshot(ctx context.Context, m manifest, p phase) (document, error) {
+	page, err := d.preserved(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	if err = matchesInk(page, p); err != nil {
+		return nil, err
+	}
+	hashes, err := d.sourceHashes(ctx, m, page)
+	if err != nil {
+		return nil, err
+	}
+	return document{"phase": p.Name, "canonicalHashes": hashes, "sourceRev": page["_rev"]}, nil
 }
